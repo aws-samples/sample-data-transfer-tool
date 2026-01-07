@@ -1,0 +1,39 @@
+rules:
+  - id: suppress-arbitrary-sleep
+    patterns:
+      - pattern: time.sleep(...)
+    message: "Intentional sleep for retry backoff and statistics reporting"
+    severity: INFO
+    languages: [python]
+    paths:
+      exclude:
+        - agent.py
+    metadata:
+      category: security
+      cwe: "CWE-1333: Inefficient Regular Expression Complexity"
+      confidence: LOW
+      likelihood: LOW
+      impact: LOW
+      subcategory: [audit]
+      # Justification: All time.sleep() calls in agent.py are intentional:
+      # - Line 317, 359: Wait for token refresh retry
+      # - Line 364, 401: Exponential backoff for failed transfers
+      # - Line 405: Statistics reporting interval (30s)
+
+  - id: suppress-subprocess-mkdir
+    patterns:
+      - pattern: subprocess.run(['mkdir', '-p', '/var/log/rclone'], ...)
+    message: "Safe subprocess call with hardcoded parameters"
+    severity: INFO
+    languages: [python]
+    paths:
+      exclude:
+        - agent.py
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+      confidence: LOW
+      likelihood: LOW
+      impact: LOW
+      subcategory: [audit]
+      # Justification: Parameters are hardcoded, no user input

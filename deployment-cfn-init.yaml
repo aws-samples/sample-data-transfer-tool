@@ -1,0 +1,987 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Rclone Transfer Agent - Complete Stack (cfn-init version)
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the Auto Scaling group
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the Auto Scaling group
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+      - c6i.large
+      - c6i.xlarge
+      - c6i.2xlarge
+      - c6i.4xlarge
+      - m6i.large
+      - m6i.xlarge
+      - m6i.2xlarge
+  InstanceCount:
+    Type: Number
+    Default: 2
+    Description: Number of EC2 instances
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: EC2 Key Pair name (optional)
+  OneDriveClientId:
+    Type: String
+    NoEcho: true
+    Description: OneDrive Application Client ID
+  OneDriveClientSecret:
+    Type: String
+    NoEcho: true
+    Description: OneDrive Application Client Secret
+  OneDriveTenantId:
+    Type: String
+    NoEcho: true
+    Description: OneDrive Tenant ID
+  DestinationBucket:
+    Type: String
+    Default: ''
+    Description: S3 bucket for destination files, agent code and logs
+  ProjectName:
+    Type: String
+    Default: 'sqs-rclone-agent'
+    Description: Project name for resource tagging
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name for resource tagging
+  QueueVisibilityTimeout:
+    Type: Number
+    Default: 3600
+    MinValue: 0
+    MaxValue: 43200
+    Description: SQS queue visibility timeout in seconds (0-43200, default 3600 = 1 hour)
+  NumWorkers:
+    Type: Number
+    Default: 16
+    MinValue: 1
+    MaxValue: 64
+    Description: Number of worker threads per agent instance
+
+Resources:
+  # Secrets Manager for OneDrive Credentials
+  OneDriveSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-onedrive-credentials'
+      Description: OneDrive application credentials
+      SecretString: !Sub |
+        {
+          "client_id": "${OneDriveClientId}",
+          "client_secret": "${OneDriveClientSecret}",
+          "tenant_id": "${OneDriveTenantId}"
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: secrets-manager
+
+  # Main SQS Queue
+  MainQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-queue'
+      VisibilityTimeout: !Ref QueueVisibilityTimeout
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: sqs-queue
+        - Key: Purpose
+          Value: Main queue for transfer tasks
+
+  # Dead Letter Queue
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-queue-dlq'
+      VisibilityTimeout: !Ref QueueVisibilityTimeout
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: sqs-dlq
+        - Key: Purpose
+          Value: Dead Letter Queue for failed transfers
+
+  # DynamoDB Table for Message Processing Status
+  EventTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-transfer-message-status-${AWS::Region}'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      KeySchema:
+        - AttributeName: source
+          KeyType: HASH
+        - AttributeName: attempt_timestamp
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: source
+          AttributeType: S
+        - AttributeName: attempt_timestamp
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: status-timestamp-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: attempt_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: dynamodb
+        - Key: Purpose
+          Value: Track transfer message processing status with retry history
+
+  # IAM Role
+  AgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-rclone-transfer-agent-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: AgentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt EventTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DestinationBucket}'
+                  - !Sub 'arn:aws:s3:::${DestinationBucket}/*'
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt MainQueue.Arn
+                  - !GetAtt DeadLetterQueue.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref OneDriveSecret
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: iam-role
+
+  # Instance Profile
+  AgentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-rclone-transfer-agent-profile-${AWS::Region}'
+      Roles:
+        - !Ref AgentRole
+
+  # Security Group
+  AgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Rclone transfer agents
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: security-group
+
+  # Launch Template
+  AgentLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - install_packages
+            - put_files
+            - configure_services
+            - start_services
+        
+        install_packages:
+          packages:
+            yum:
+              python3-pip: []
+          commands:
+            01_install_rclone:
+              command: "curl -s https://rclone.org/install.sh | bash"
+              test: "test ! -f /usr/bin/rclone"
+            02_install_boto3:
+              command: "pip3 install boto3 requests pathspec"
+              test: "! python3 -c 'import boto3' 2>/dev/null"
+        
+        put_files:
+          files:
+            /home/ec2-user/agent/refresh_rclone_config.py:
+              content: |
+                #!/usr/bin/env python3
+                """
+                Simplified OneDrive Token Refresh Script for rclone
+                Only maintains 3 remotes: s3, onedrive, sharepoint
+                """
+                import requests
+                import json
+                import configparser
+                import boto3
+                import os
+                import logging
+                from pathlib import Path
+                from datetime import datetime, timedelta, timezone
+                
+                logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+                logger = logging.getLogger(__name__)
+                
+                def get_credentials():
+                    """Retrieve OneDrive credentials from AWS Secrets Manager"""
+                    secrets_client = boto3.client('secretsmanager', region_name=os.environ['AWS_REGION'])
+                    secret_response = secrets_client.get_secret_value(SecretId=os.environ['SECRET_ARN'])
+                    credentials = json.loads(secret_response['SecretString'])
+                    return credentials['client_id'], credentials['client_secret'], credentials['tenant_id']
+                
+                def get_token():
+                    """Get OAuth2 token from Microsoft"""
+                    CLIENT_ID, CLIENT_SECRET, TENANT_ID = get_credentials()
+                    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+                    data = {
+                        'client_id': CLIENT_ID,
+                        'client_secret': CLIENT_SECRET,
+                        'scope': 'https://graph.microsoft.com/.default',
+                        'grant_type': 'client_credentials'
+                    }
+                    
+                    response = requests.post(token_url, data=data)
+                    response.raise_for_status()
+                    token_data = response.json()
+                    
+                    expires_in = token_data.get('expires_in', 3600)
+                    expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                    
+                    return {
+                        'access_token': token_data['access_token'],
+                        'token_type': 'Bearer',
+                        'expiry': expiry.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
+                        'expires_in': expires_in
+                    }
+                
+                def update_rclone_config():
+                    """Update rclone configuration with simplified 3-remote setup"""
+                    logger.info("Starting rclone configuration update")
+                    
+                    rclone_token = get_token()
+                    CLIENT_ID, CLIENT_SECRET, TENANT_ID = get_credentials()
+                    
+                    for user_home in ['/root', '/home/ec2-user']:
+                        logger.info(f"Updating rclone config for {user_home}")
+                        rclone_config_path = Path(user_home) / ".config/rclone/rclone.conf"
+                        rclone_config_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        config = configparser.ConfigParser()
+                        config.read(rclone_config_path)
+                        
+                        # Configure S3 remote (no token update needed)
+                        if 's3' not in config:
+                            config.add_section('s3')
+                        config['s3'].update({
+                            'type': 's3',
+                            'provider': 'AWS',
+                            'env_auth': 'true',
+                            'region': os.environ.get('S3_REGION') or os.environ.get('AWS_REGION', 'eu-central-1')
+                        })
+                        
+                        # Configure OneDrive remote (business drive) - update token
+                        if 'onedrive' not in config:
+                            config.add_section('onedrive')
+                        config['onedrive'].update({
+                            'type': 'onedrive',
+                            'client_id': CLIENT_ID,
+                            'client_secret': CLIENT_SECRET,
+                            'tenant': TENANT_ID,
+                            'auth_url': f'https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/authorize',
+                            'token_url': f'https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token',
+                            'drive_type': 'business',
+                            'token': json.dumps(rclone_token)
+                        })
+                        
+                        # Configure SharePoint remote (document library) - update token
+                        if 'sharepoint' not in config:
+                            config.add_section('sharepoint')
+                        config['sharepoint'].update({
+                            'type': 'onedrive',
+                            'client_id': CLIENT_ID,
+                            'client_secret': CLIENT_SECRET,
+                            'tenant': TENANT_ID,
+                            'auth_url': f'https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/authorize',
+                            'token_url': f'https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token',
+                            'drive_type': 'documentlibrary',
+                            'token': json.dumps(rclone_token)
+                        })
+                        
+                        logger.info("Updated tokens for onedrive and sharepoint remotes")
+                        
+                        # Write configuration file
+                        with open(rclone_config_path, 'w') as f:
+                            config.write(f)
+                        logger.info(f"Config saved: {rclone_config_path}")
+                        
+                        # Fix permissions for ec2-user
+                        if user_home == '/home/ec2-user':
+                            import subprocess
+                            subprocess.run(['chown', '-R', 'ec2-user:ec2-user', str(rclone_config_path.parent.parent)])
+                    
+                    logger.info("Rclone configuration update completed successfully")
+                
+                if __name__ == '__main__':
+                    try:
+                        update_rclone_config()
+                        logger.info("Rclone configuration update completed successfully")
+                    except Exception as e:
+                        logger.error(f"Failed to update rclone configuration: {str(e)}", exc_info=True)
+                        raise
+                
+              mode: "000755"
+              owner: ec2-user
+              group: ec2-user
+              owner: ec2-user
+              group: ec2-user
+            /home/ec2-user/agent/agent.py:
+              content: |
+                #!/usr/bin/env python3
+                """
+                SQS Rclone Transfer Agent
+                Consumes messages from SQS queue and performs rclone transfers
+                """
+                import subprocess
+                import json
+                import boto3
+                import threading
+                import time
+                import os
+                import logging
+                from datetime import datetime
+                
+                # Configure logging
+                logging.basicConfig(
+                    level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                )
+                logger = logging.getLogger(__name__)
+                
+                def update_status(dynamodb, table_name, source, status, error_message=None, completed_at=None, started_at=None, transfer_stats=None, instance_id=None, rclone_command=None, attempt_timestamp=None):
+                    """Update transfer status in DynamoDB with retry tracking"""
+                    try:
+                        now = datetime.utcnow().isoformat()
+                        # Use provided attempt_timestamp or current time for new attempts
+                        if attempt_timestamp is None:
+                            attempt_timestamp = now
+                        
+                        item = {
+                            'source': {'S': source},
+                            'attempt_timestamp': {'S': attempt_timestamp},
+                            'status': {'S': status},
+                            'updated_at': {'S': now}
+                        }
+                        if instance_id:
+                            item['instance_id'] = {'S': instance_id}
+                        if error_message:
+                            item['error_message'] = {'S': error_message}
+                        if completed_at:
+                            item['completed_at'] = {'S': completed_at}
+                        if started_at:
+                            item['started_at'] = {'S': started_at}
+                        if rclone_command:
+                            item['rclone_command'] = {'S': ' '.join(rclone_command)}
+                        if transfer_stats:
+                            if 'transferred_bytes' in transfer_stats:
+                                item['transferred_bytes'] = {'N': str(transfer_stats['transferred_bytes'])}
+                            if 'transferred_files' in transfer_stats:
+                                item['transferred_files'] = {'N': str(transfer_stats['transferred_files'])}
+                            if 'elapsed_seconds' in transfer_stats:
+                                item['elapsed_seconds'] = {'N': str(transfer_stats['elapsed_seconds'])}
+                        
+                        dynamodb.put_item(TableName=table_name, Item=item)
+                        logger.info(f"Updated status for {source}: {status} (attempt: {attempt_timestamp})")
+                    except Exception as e:
+                        logger.error(f"Failed to update status for {source}: {str(e)}")
+                
+                def parse_transfer_stats(output):
+                    """Parse rclone output to extract transfer statistics"""
+                    import re
+                    stats = {}
+                    
+                    try:
+                        # Extract transferred bytes (e.g., "Transferred:        2 MiB / 2 MiB")
+                        bytes_match = re.search(r'Transferred:\s+(\d+(?:\.\d+)?)\s*(\w+)', output)
+                        if bytes_match:
+                            value, unit = float(bytes_match.group(1)), bytes_match.group(2).upper()
+                            multiplier = {'B': 1, 'KIB': 1024, 'MIB': 1024**2, 'GIB': 1024**3, 'TIB': 1024**4}
+                            stats['transferred_bytes'] = int(value * multiplier.get(unit, 1))
+                        
+                        # Extract transferred files (e.g., "Transferred:            2 / 2")
+                        files_match = re.search(r'Transferred:\s+(\d+)\s*/\s*\d+', output)
+                        if files_match:
+                            stats['transferred_files'] = int(files_match.group(1))
+                        
+                        # Extract elapsed time (e.g., "Elapsed time:         0.9s")
+                        time_match = re.search(r'Elapsed time:\s+(\d+(?:\.\d+)?)s', output)
+                        if time_match:
+                            stats['elapsed_seconds'] = float(time_match.group(1))
+                    
+                    except Exception as e:
+                        logger.warning(f"Failed to parse transfer stats: {str(e)}")
+                    
+                    return stats
+                
+                def run_rclone_copy(message, dynamodb, table_name, region, instance_id):
+                    """Execute rclone copyto command for a message"""
+                    source = message['source']
+                    destination = message['destination']
+                    rclone_args = message.get('rclone_args', [])
+                    
+                    # Generate single attempt timestamp for this entire transfer attempt
+                    attempt_timestamp = datetime.utcnow().isoformat()
+                    started_time = attempt_timestamp  # Use same timestamp for started_at
+                    
+                    logger.info(f"Starting transfer: {source} -> {destination}")
+                    if rclone_args:
+                        logger.info(f"Additional rclone args: {rclone_args}")
+                    
+                    # Build rclone copyto command
+                    cmd = [
+                        'rclone', 'copyto',
+                        source,
+                        destination,
+                        '--s3-no-check-bucket',
+                        '--stats', '1m',
+                        '--retries', '3',
+                        '--low-level-retries', '10',
+                        '--log-level', 'INFO',
+                        '--onedrive-encoding', 'Slash,LtGt,DoubleQuote,Asterisk,Pipe,BackSlash,LeftSpace,LeftCrLfHtVt,RightSpace,RightCrLfHtVt,InvalidUtf8,Dot'
+                    ]
+                    
+                    # Add additional rclone arguments if provided
+                    if rclone_args and isinstance(rclone_args, list):
+                        cmd.extend(rclone_args)
+                        logger.info(f"Extended command with args: {rclone_args}")
+                    
+                    update_status(dynamodb, table_name, source, 'PROCESSING', started_at=started_time, instance_id=instance_id, rclone_command=cmd, attempt_timestamp=attempt_timestamp)
+                    
+                    try:
+                        # Execute rclone
+                        logger.info(f"Executing rclone copyto for {source}")
+                        result = subprocess.run(cmd, capture_output=True, check=False)  # nosemgrep: dangerous-subprocess-use-audit
+                        try:
+                            output = result.stderr.decode('utf-8') if result.stderr else result.stdout.decode('utf-8')
+                        except UnicodeDecodeError:
+                            output = result.stderr.decode('utf-8', errors='replace') if result.stderr else result.stdout.decode('utf-8', errors='replace')
+                        
+                        # Check if transfer was successful
+                        last_lines = output.strip().split('\n')[-5:]
+                        has_summary = any('Transferred:' in line and '100%' in line for line in last_lines)
+                        
+                        if result.returncode == 0 and has_summary:
+                            logger.info(f"Transfer completed successfully: {source}")
+                            completed_time = datetime.utcnow().isoformat()
+                            transfer_stats = parse_transfer_stats(output)
+                            update_status(dynamodb, table_name, source, 'SUCCESS', completed_at=completed_time, started_at=started_time, transfer_stats=transfer_stats, instance_id=instance_id, rclone_command=cmd, attempt_timestamp=attempt_timestamp)
+                            return True, None
+                        elif result.returncode == 0:
+                            logger.info(f"Transfer completed (no summary found): {source}")
+                            completed_time = datetime.utcnow().isoformat()
+                            transfer_stats = parse_transfer_stats(output)
+                            update_status(dynamodb, table_name, source, 'SUCCESS', completed_at=completed_time, started_at=started_time, transfer_stats=transfer_stats, instance_id=instance_id, rclone_command=cmd, attempt_timestamp=attempt_timestamp)
+                            return True, None
+                        else:
+                            error_msg = result.stderr if result.stderr else 'Unknown error'
+                            logger.error(f"Transfer failed: {source} - {error_msg}")
+                            update_status(dynamodb, table_name, source, 'FAILED', error_message=error_msg, instance_id=instance_id, rclone_command=cmd, attempt_timestamp=attempt_timestamp)
+                            return False, error_msg
+                            
+                    except Exception as e:
+                        error_msg = str(e)
+                        logger.error(f"Exception during transfer {source}: {error_msg}", exc_info=True)
+                        update_status(dynamodb, table_name, source, 'FAILED', error_message=error_msg, instance_id=instance_id, rclone_command=cmd, attempt_timestamp=attempt_timestamp)
+                        return False, error_msg
+                
+                class SimpleWorkerAgent:
+                    """SQS consumer agent with multiple worker threads"""
+                    
+                    def __init__(self, queue_url, dlq_url, region, instance_id):
+                        self.queue_url = queue_url
+                        self.dlq_url = dlq_url
+                        self.region = region
+                        self.instance_id = instance_id
+                        self.running = True
+                        self.stats = {'success': 0, 'failed': 0, 'total': 0}
+                        self.stats_lock = threading.Lock()
+                        self.dynamodb = boto3.client('dynamodb', region_name=region)
+                        self.table_name = os.environ.get('DYNAMODB_TABLE', f'transfer-message-status-{region}')
+                        logger.info(f"Initialized agent for queue: {queue_url}")
+                        logger.info(f"Instance ID: {instance_id}")
+                        logger.info(f"DLQ: {dlq_url}")
+                        logger.info(f"DynamoDB table: {self.table_name}")
+                    
+                    def worker(self, worker_id):
+                        """Worker thread that processes messages from SQS"""
+                        logger.info(f"Worker-{worker_id} started")
+                        sqs = boto3.client('sqs', region_name=self.region)
+                        
+                        while self.running:
+                            try:
+                                # Receive message from SQS with 1 hour visibility timeout
+                                response = sqs.receive_message(
+                                    QueueUrl=self.queue_url,
+                                    MaxNumberOfMessages=1,
+                                    WaitTimeSeconds=20,
+                                    VisibilityTimeout=3600  # 1 hour visibility timeout
+                                )
+                                
+                                messages = response.get('Messages', [])
+                                if not messages:
+                                    continue
+                                
+                                msg = messages[0]
+                                receipt_handle = msg['ReceiptHandle']
+                                
+                                try:
+                                    body = json.loads(msg['Body'])
+                                    message = {
+                                        'source': body.get('source'),
+                                        'destination': body.get('destination'),
+                                        'rclone_args': body.get('rclone_args', [])
+                                    }
+                                    
+                                    if not message['source'] or not message['destination']:
+                                        logger.error(f"Worker-{worker_id} invalid message format: {body}")
+                                        # Delete invalid message to prevent reprocessing
+                                        sqs.delete_message(
+                                            QueueUrl=self.queue_url,
+                                            ReceiptHandle=receipt_handle
+                                        )
+                                        continue
+                                    
+                                    logger.info(f"Worker-{worker_id} processing message: {message['source']}")
+                                    
+                                    # Process the transfer (single attempt)
+                                    success, error_msg = run_rclone_copy(
+                                        message, self.dynamodb, self.table_name, 
+                                        self.region, self.instance_id
+                                    )
+                                    
+                                    if success:
+                                        # Transfer successful - delete message from queue (commit)
+                                        sqs.delete_message(
+                                            QueueUrl=self.queue_url,
+                                            ReceiptHandle=receipt_handle
+                                        )
+                                        logger.info(f"Worker-{worker_id} completed transfer: {message['source']}")
+                                        
+                                        # Update statistics
+                                        with self.stats_lock:
+                                            self.stats['total'] += 1
+                                            self.stats['success'] += 1
+                                    else:
+                                        # Transfer failed - do NOT delete or change visibility
+                                        # Let message timeout naturally to increment ReceiveCount
+                                        # After 3 retries, SQS will automatically move to DLQ
+                                        logger.error(f"Worker-{worker_id} transfer failed, message will retry after timeout: {message['source']} - {error_msg}")
+                                        # Note: run_rclone_copy already recorded the FAILED status
+                                        
+                                        # Update statistics
+                                        with self.stats_lock:
+                                            self.stats['total'] += 1
+                                            self.stats['failed'] += 1
+                                
+                                except json.JSONDecodeError as e:
+                                    logger.error(f"Worker-{worker_id} failed to parse message: {str(e)}")
+                                    # Delete malformed message
+                                    sqs.delete_message(
+                                        QueueUrl=self.queue_url,
+                                        ReceiptHandle=receipt_handle
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Worker-{worker_id} error processing message: {str(e)}", exc_info=True)
+                                    # Let message become visible again for retry
+                                    if 'message' in locals():
+                                        update_status(self.dynamodb, self.table_name, 
+                                                    message.get('source', 'unknown'), 'FAILED', 
+                                                    error_message=str(e), instance_id=self.instance_id,
+                                                    rclone_command=locals().get('cmd', []))
+                            
+                            except Exception as e:
+                                logger.error(f"Worker-{worker_id} error receiving messages: {str(e)}", exc_info=True)
+                                time.sleep(5)  # nosemgrep: arbitrary-sleep - Error recovery delay
+                    
+                    def stats_reporter(self):
+                        """Periodically report statistics"""
+                        while self.running:
+                            time.sleep(30)  # nosemgrep: arbitrary-sleep - Statistics reporting interval
+                            with self.stats_lock:
+                                if self.stats['total'] > 0:
+                                    logger.info(
+                                        f"Statistics - Total: {self.stats['total']}, "
+                                        f"Success: {self.stats['success']}, "
+                                        f"Failed: {self.stats['failed']}"
+                                    )
+                    
+                    def run(self, num_workers):
+                        """Start the agent with specified number of workers"""
+                        logger.info(f"Starting agent with {num_workers} workers")
+                        
+                        # Start worker threads
+                        for i in range(num_workers):
+                            thread = threading.Thread(
+                                target=self.worker,
+                                args=(i,),
+                                daemon=True,
+                                name=f'Worker-{i}'
+                            )
+                            thread.start()
+                        
+                        # Start stats reporter thread
+                        stats_thread = threading.Thread(
+                            target=self.stats_reporter,
+                            daemon=True,
+                            name='StatsReporter'
+                        )
+                        stats_thread.start()
+                        
+                        logger.info("All threads started, agent is running")
+                        
+                        # Main loop
+                        try:
+                            while self.running:
+                                time.sleep(1)  # nosemgrep: arbitrary-sleep - Main loop heartbeat
+                        except KeyboardInterrupt:
+                            logger.info("Received shutdown signal")
+                            self.running = False
+                            time.sleep(5)  # nosemgrep: arbitrary-sleep
+                            
+                            # Print final statistics
+                            with self.stats_lock:
+                                logger.info(
+                                    f"Final Statistics - Total: {self.stats['total']}, "
+                                    f"Success: {self.stats['success']}, "
+                                    f"Failed: {self.stats['failed']}"
+                                )
+                
+                if __name__ == '__main__':
+                    # Get configuration from environment variables
+                    region = os.environ.get('AWS_REGION', 'us-west-2')
+                    queue_name = os.environ.get('QUEUE_NAME', 'sqs-rclone-test')
+                    
+                    # Get instance ID from EC2 metadata (IMDSv2)
+                    try:
+                        import urllib.request
+                        # Get token for IMDSv2
+                        token_req = urllib.request.Request('http://169.254.169.254/latest/api/token', method='PUT')
+                        token_req.add_header('X-aws-ec2-metadata-token-ttl-seconds', '21600')
+                        token = urllib.request.urlopen(token_req, timeout=2).read().decode('utf-8')
+                        
+                        # Get instance ID with token
+                        id_req = urllib.request.Request('http://169.254.169.254/latest/meta-data/instance-id')
+                        id_req.add_header('X-aws-ec2-metadata-token', token)
+                        instance_id = urllib.request.urlopen(id_req, timeout=2).read().decode('utf-8')
+                    except:
+                        instance_id = 'unknown'
+                    
+                    logger.info(f"Starting SQS Rclone Transfer Agent")
+                    logger.info(f"Instance ID: {instance_id}")
+                    logger.info(f"Region: {region}")
+                    logger.info(f"Queue Name: {queue_name}")
+                    
+                    # Get queue URLs
+                    sqs = boto3.client('sqs', region_name=region)
+                    response = sqs.get_queue_url(QueueName=queue_name)
+                    queue_url = response['QueueUrl']
+                    
+                    # Get DLQ URL
+                    dlq_response = sqs.get_queue_url(QueueName=f'{queue_name}-dlq')
+                    dlq_url = dlq_response['QueueUrl']
+                    
+                    logger.info(f"Queue URL: {queue_url}")
+                    logger.info(f"DLQ URL: {dlq_url}")
+                    
+                    # Create and run agent
+                    num_workers = int(os.environ.get('NUM_WORKERS', 16))
+                    logger.info(f"Number of workers: {num_workers}")
+                    agent = SimpleWorkerAgent(queue_url, dlq_url, region, instance_id)
+                    agent.run(num_workers=num_workers)
+                
+              mode: "000755"
+              owner: ec2-user
+              group: ec2-user
+            /etc/systemd/system/rclone-refresh.service:
+              content: !Sub |
+                [Unit]
+                Description=Rclone Token Refresh
+                
+                [Service]
+                Type=oneshot
+                User=root
+                WorkingDirectory=/home/ec2-user/agent
+                Environment="SECRET_ARN=${OneDriveSecret}"
+                Environment="S3_REGION=${AWS::Region}"
+                Environment="AWS_REGION=${AWS::Region}"
+                ExecStart=/usr/bin/python3 /home/ec2-user/agent/refresh_rclone_config.py
+              mode: '000644'
+              owner: root
+              group: root
+            /etc/systemd/system/rclone-refresh.timer:
+              content: |
+                [Unit]
+                Description=Rclone Token Refresh Timer
+                
+                [Timer]
+                OnBootSec=50min
+                OnUnitActiveSec=50min
+                
+                [Install]
+                WantedBy=timers.target
+              mode: '000644'
+              owner: root
+              group: root
+            /etc/systemd/system/rclone-agent.service:
+              content: !Sub |
+                [Unit]
+                Description=Rclone Agent
+                After=network.target rclone-refresh.service
+                Wants=rclone-refresh.timer
+                
+                [Service]
+                Type=simple
+                User=root
+                WorkingDirectory=/home/ec2-user/agent
+                Environment="AWS_REGION=${AWS::Region}"
+                Environment="QUEUE_NAME=${AWS::StackName}-queue"
+                Environment="DESTINATION_BUCKET=${DestinationBucket}"
+                Environment="DYNAMODB_TABLE=${AWS::StackName}-transfer-message-status-${AWS::Region}"
+                Environment="NUM_WORKERS=${NumWorkers}"
+                ExecStart=/usr/bin/python3 /home/ec2-user/agent/agent.py
+                Restart=always
+                RestartSec=10
+                
+                [Install]
+                WantedBy=multi-user.target
+              mode: '000644'
+              owner: root
+              group: root
+        
+        configure_services:
+          commands:
+            01_download_user_list:
+              command: !Sub "aws s3 sync s3://${DestinationBucket}/user-list/ /home/ec2-user/agent/ --region ${AWS::Region} || echo 'No user-list found, will use API fallback'"
+            02_refresh_token:
+              command: !Sub |
+                set -e
+                timeout 300 python3 /home/ec2-user/agent/refresh_rclone_config.py
+                EXIT_CODE=$?
+                if [ $EXIT_CODE -eq 124 ]; then
+                  echo "ERROR: Token refresh timed out after 300 seconds" >&2
+                  exit 1
+                elif [ $EXIT_CODE -ne 0 ]; then
+                  echo "ERROR: Token refresh failed with exit code $EXIT_CODE" >&2
+                  exit 1
+                fi
+                echo "Token refresh completed successfully"
+              env:
+                SECRET_ARN: !Ref OneDriveSecret
+                S3_REGION: !Ref 'AWS::Region'
+                AWS_REGION: !Ref AWS::Region
+            03_reload_systemd:
+              command: "systemctl daemon-reload"
+        
+        start_services:
+          services:
+            systemd:
+              rclone-refresh.timer:
+                enabled: true
+                ensureRunning: true
+              rclone-agent:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/systemd/system/rclone-agent.service
+                  - /home/ec2-user/agent/agent.py
+
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-launch-template'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+        IamInstanceProfile:
+          Arn: !GetAtt AgentInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AgentSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 50
+              VolumeType: gp3
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            # Install cfn-bootstrap
+            yum install -y aws-cfn-bootstrap
+            
+            # Run cfn-init
+            /opt/aws/bin/cfn-init -v \
+              --stack ${AWS::StackName} \
+              --resource AgentLaunchTemplate \
+              --region ${AWS::Region} \
+              --configsets default
+            
+            # Signal success or failure
+            /opt/aws/bin/cfn-signal -e $? \
+              --stack ${AWS::StackName} \
+              --resource AgentASG \
+              --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Component
+                Value: ec2-instance
+          - ResourceType: volume
+            Tags:
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Component
+                Value: ebs-volume
+
+  # Auto Scaling Group
+  AgentASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref InstanceCount
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 2
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AgentLaunchTemplate
+        Version: !GetAtt AgentLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref InstanceCount
+      MaxSize: !Ref InstanceCount
+      DesiredCapacity: !Ref InstanceCount
+      VPCZoneIdentifier: !Ref Subnets
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-agent'
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+        - Key: Component
+          Value: auto-scaling-group
+          PropagateAtLaunch: true
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+Outputs:
+  MainQueueUrl:
+    Description: Main SQS Queue URL
+    Value: !Ref MainQueue
+  MainQueueArn:
+    Description: Main SQS Queue ARN
+    Value: !GetAtt MainQueue.Arn
+  QueueName:
+    Description: SQS Queue Name
+    Value: !GetAtt MainQueue.QueueName
+  DeadLetterQueueUrl:
+    Description: Dead Letter Queue URL
+    Value: !Ref DeadLetterQueue
+  DeadLetterQueueArn:
+    Description: Dead Letter Queue ARN
+    Value: !GetAtt DeadLetterQueue.Arn
+  DynamoDBTable:
+    Description: DynamoDB Table Name
+    Value: !Ref EventTable
+  InstanceProfileArn:
+    Description: Instance Profile ARN
+    Value: !GetAtt AgentInstanceProfile.Arn

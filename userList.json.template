@@ -1,0 +1,10 @@
+[
+  {
+    "email": "user1@example.onmicrosoft.com",
+    "workcode": "USER001"
+  },
+  {
+    "email": "user2@example.onmicrosoft.com",
+    "workcode": "USER002"
+  }
+]

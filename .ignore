@@ -1,0 +1,59 @@
+WXWork/
+CefCache/
+Service Worker/
+CacheStorage/
+WXWorkCefCache/
+Extensions/
+Cache/
+IndexedDB/
+WeChat Files/
+xwechat_files/
+Code Cache/
+site-packages/
+cache/
+CacheMapping/
+.venv/
+node_modules/
+venv/
+ScriptCache/
+GPUCache/
+Local Storage/
+Cache_Data/
+DawnCache/
+__pycache__/
+GoogleDrive/
+Caches/
+DawnGraphiteCache/
+ShaderCache/
+.git/
+Microsoft Edge/
+blob_storage/
+TempFile/
+Microsoft Teams Chat Files/
+GrShaderCache/
+OneNote_RecycleBin/
+Adobe/Premiere Pro/
+WhatsApp/
+temp_dir/
+Temp/
+logs/
+.Trash/
+Old Firefox Data/
+Log/
+Lightroom Catalog Previews.lrdata/
+temp/
+log/
+Logs/
+.idea/
+tmp/
+.obsidian/
+Unity/
+Spotify/
+Anaconda/
+DaVinci Resolve/
+Skype/
+*.one
+*.onetoc
+*.onetoc2
+*.onepkg
+*.onecache

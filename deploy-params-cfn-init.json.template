@@ -1,0 +1,34 @@
+[
+  {
+    "ParameterKey": "VPC",
+    "ParameterValue": "vpc-xxxxx"
+  },
+  {
+    "ParameterKey": "Subnets",
+    "ParameterValue": "subnet-xxxxx,subnet-yyyyy"
+  },
+  {
+    "ParameterKey": "InstanceType",
+    "ParameterValue": "t3.large"
+  },
+  {
+    "ParameterKey": "InstanceCount",
+    "ParameterValue": "1"
+  },
+  {
+    "ParameterKey": "OneDriveClientId",
+    "ParameterValue": "YOUR_CLIENT_ID_HERE"
+  },
+  {
+    "ParameterKey": "OneDriveClientSecret",
+    "ParameterValue": "YOUR_CLIENT_SECRET_HERE"
+  },
+  {
+    "ParameterKey": "OneDriveTenantId",
+    "ParameterValue": "YOUR_TENANT_ID_HERE"
+  },
+  {
+    "ParameterKey": "DestinationBucket",
+    "ParameterValue": "your-bucket-name"
+  }
+]
