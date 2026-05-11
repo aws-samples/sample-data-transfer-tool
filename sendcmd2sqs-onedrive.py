@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """迁移所有用户的 OneDrive 文件"""
+import argparse
 import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import boto3
 from botocore.config import Config
+from dateutil import parser as dateutil_parser
 import pathspec
 import requests
 from requests.exceptions import RequestException
@@ -22,14 +24,14 @@ TENANT_ID = ""
 
 # AWS 配置
 SQS_QUEUE_URL = ""
-AWS_REGION = "eu-central-1"
+AWS_REGION = ""
 TARGET_S3_BUCKET = ""
 DESTINATION_PREFIX = "n-one-drive"
 LOG_S3_PREFIX = "aws-onedrive-migration-logs"
 
 # 文件配置
 USER_LIST_FILE = "userList.json"
-IGNORE_FILE = ".ignore"
+IGNORE_FILE = ".ignore-onedrive"
 
 # 网络请求配置（Microsoft Graph API）
 REQUEST_TIMEOUT = (10, 60)  # (connect_timeout, read_timeout)
@@ -154,6 +156,68 @@ def load_ignore_patterns():
         return pathspec.PathSpec.from_lines('gitwildmatch', [])
 
 
+def parse_cutoff_date(date_string):
+    """Parse and validate cutoff date from command line
+
+    Args:
+        date_string: ISO 8601 date string (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+
+    Returns:
+        datetime: UTC datetime object
+
+    Raises:
+        ValueError: If date format is invalid
+    """
+    try:
+        dt = datetime.fromisoformat(date_string)
+
+        # If no timezone specified, assume UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+
+        return dt
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid date format: {date_string}. "
+            f"Expected ISO 8601 format like '2024-01-01' or '2024-01-15T10:30:00'"
+        ) from e
+
+
+def should_include_item(item, cutoff_date, item_path):
+    """Check if item should be included based on creation date
+
+    Args:
+        item: API response item dict
+        cutoff_date: UTC datetime object (None means include all)
+        item_path: Relative path for logging
+
+    Returns:
+        tuple: (should_include: bool, reason: str)
+    """
+    if cutoff_date is None:
+        return True, "no_filter"
+
+    created_str = item.get('createdDateTime')
+
+    if not created_str:
+        logger.warning(f"Missing createdDateTime for: {item_path}, including by default")
+        return True, "missing_date"
+
+    try:
+        created_dt = dateutil_parser.isoparse(created_str)
+
+        if created_dt >= cutoff_date:
+            return True, "after_cutoff"
+        else:
+            return False, f"created_{created_dt.strftime('%Y-%m-%d')}"
+
+    except (ValueError, TypeError) as e:
+        logger.error(f"Failed to parse createdDateTime '{created_str}' for: {item_path}, including by default")
+        return True, "parse_error"
+
+
 @retry(
     stop=stop_after_attempt(MAX_RETRIES),
     wait=custom_wait_strategy,
@@ -260,18 +324,19 @@ def list_users():
         return data
 
 
-def get_user_drive(user_id, headers):
+def get_user_drive(user_id, token_manager):
     """获取用户的 OneDrive 信息
 
     Args:
         user_id: 用户ID
-        headers: 请求头（包含认证信息）
+        token_manager: TokenManager 实例，用于获取有效的认证令牌
 
     Returns:
         dict: Drive信息，如果获取失败返回None
     """
     url = f"https://graph.microsoft.com/v1.0/users/{user_id}/drive"
     try:
+        headers = token_manager.get_headers()
         response = request_with_retry(url, headers)
     except (RetryableHTTPError, RequestException) as e:
         logger.error(f"获取用户Drive失败: {e}")
@@ -286,16 +351,18 @@ def get_user_drive(user_id, headers):
 
 
 # ============ 核心业务函数 ============
-def send_to_sqs(drive_id, workcode, name, item_id, parent_id, extension, parent_path):
+def send_to_sqs(drive_id, workcode, name, item_id, parent_id, extension, parent_path, file_hash=None):
     """拼装消息并发送到SQS队列
 
     Args:
+        drive_id: Drive ID
         workcode: 用户工号
         name: 文件名
         item_id: 文件ID
         parent_id: 父目录ID
         extension: 文件扩展名
         parent_path: 父目录路径
+        file_hash: 文件哈希值 (quickXorHash)，可选
 
     Returns:
         bool: 发送成功返回 True，失败返回 False
@@ -308,16 +375,25 @@ def send_to_sqs(drive_id, workcode, name, item_id, parent_id, extension, parent_
     logger.debug(f"Source: {source}")
     logger.debug(f"Destination: {destination}")
 
+    # Build rclone_args conditionally based on file_hash availability
+    rclone_args = [
+        "--onedrive-drive-id",
+        f"{drive_id}",
+        "--progress"
+    ]
+
+    # Add hash metadata header if available
+    if file_hash:
+        rclone_args.extend([
+            "--header-upload",
+            f"x-amz-meta-hash:{file_hash}"
+        ])
+        logger.debug(f"Added hash metadata for {name}: {file_hash}")
+
     message_body = {
         "source": source,
         "destination": destination,
-        "rclone_args": [
-            "--onedrive-drive-id",
-            f"{drive_id}",
-            "--progress",
-            "--header-upload",
-            f"x-amz-meta-name:{clean_parent_path}/{name}"
-        ]
+        "rclone_args": rclone_args
     }
 
     try:
@@ -332,21 +408,24 @@ def send_to_sqs(drive_id, workcode, name, item_id, parent_id, extension, parent_
         return False
 
 
-def process_files(drive_id, user_id, workcode, headers, ignore_spec, path="root", current_path=""):
+def process_files(drive_id, user_id, workcode, token_manager, ignore_spec, cutoff_date=None, path="root", current_path=""):
     """递归列出用户 OneDrive 中的文件和文件夹
 
     Args:
+        drive_id: Drive ID
         user_id: 用户ID
         workcode: 用户工号
-        headers: 请求头（包含认证信息）
+        token_manager: TokenManager 实例，用于获取有效的认证令牌
         ignore_spec: pathspec.PathSpec 过滤规则对象
+        cutoff_date: UTC datetime object for filtering (None = no filter)
         path: 当前API路径，默认为root
         current_path: 当前相对路径，用于过滤规则匹配
 
     Returns:
-        int: 处理的文件数量
+        tuple: (processed_count, skipped_count)
     """
     file_count = 0
+    skipped_count = 0
 
     try:
         url = f"https://graph.microsoft.com/v1.0/users/{user_id}/drive/{path}/children"
@@ -354,6 +433,8 @@ def process_files(drive_id, user_id, workcode, headers, ignore_spec, path="root"
         # 处理分页逻辑
         while url:
             try:
+                # 每次请求前获取最新的认证头，确保 token 有效
+                headers = token_manager.get_headers()
                 response = request_with_retry(url, headers)
             except (RetryableHTTPError, RequestException) as e:
                 logger.error(f"请求失败，处理中断，已处理 {file_count} 个文件: {e}, "
@@ -378,13 +459,28 @@ def process_files(drive_id, user_id, workcode, headers, ignore_spec, path="root"
                         logger.info(f"跳过文件夹（已过滤）: {item_relative_path}")
                         continue
 
+                    # NOTE: For folders, we always recurse regardless of creation date
+                    # because old folders may contain new files
                     item_id = item['id']
-                    subfolder_count = process_files(drive_id, user_id, workcode, headers, ignore_spec, f"items/{item_id}", item_relative_path)
-                    file_count += subfolder_count
-                
+                    subfolder_processed, subfolder_skipped = process_files(
+                        drive_id, user_id, workcode, token_manager, ignore_spec,
+                        cutoff_date, f"items/{item_id}", item_relative_path
+                    )
+                    file_count += subfolder_processed 
+                    skipped_count += subfolder_skipped
+
                 else:
+                    # .ignore filtering (existing)
                     if ignore_spec.match_file(item_relative_path):
-                        logger.info(f"跳过文件（已过滤）: {item_relative_path}")
+                        logger.debug(f"跳过文件（已过滤）: {item_relative_path}")
+                        continue
+
+                    # Date-based filtering
+                    should_include, reason = should_include_item(item, cutoff_date, item_relative_path)
+
+                    if not should_include:
+                        logger.debug(f"跳过文件（创建时间早于cutoff）: {item_relative_path}, {reason}")
+                        skipped_count += 1
                         continue
 
                     extension = get_file_extension(name)
@@ -393,12 +489,22 @@ def process_files(drive_id, user_id, workcode, headers, ignore_spec, path="root"
                     parent_path = parent_ref.get('path', 'N/A')
                     parent_id = parent_ref.get('id', 'N/A')
 
+                    # Extract file hash (quickXorHash) if available
+                    file_hash = None
+                    if 'file' in item:
+                        hashes = item.get('file', {}).get('hashes', {})
+                        file_hash = hashes.get('quickXorHash')
+                        if file_hash:
+                            logger.debug(f"Extracted hash for {name}: {file_hash}")
+                        else:
+                            logger.debug(f"No hash available for {name}")
+
                     logger.debug(f"处理文件 - Name: {name}, Extension: {extension}, ID: {item_id}")
                     logger.debug(f"Parent Path: {parent_path}, Parent ID: {parent_id}")
                     logger.debug(f"目标路径: /{DESTINATION_PREFIX}/{workcode}/{parent_id}/{item_id}{extension}")
 
                     # 只有发送成功才计数
-                    if send_to_sqs(drive_id, workcode, name, item_id, parent_id, extension, parent_path):
+                    if send_to_sqs(drive_id, workcode, name, item_id, parent_id, extension, parent_path, file_hash):
                         file_count += 1
 
             url = response_data.get('@odata.nextLink')
@@ -408,16 +514,17 @@ def process_files(drive_id, user_id, workcode, headers, ignore_spec, path="root"
     except Exception as e:
         logger.error(f"处理文件时发生未预期错误，处理中断，已处理 {file_count} 个文件: {e}", exc_info=True)
 
-    return file_count
+    return file_count, skipped_count
 
 
-def process_user(user, headers, ignore_spec):
+def process_user(user, token_manager, ignore_spec, cutoff_date=None):
     """处理单个用户的 OneDrive 文件列表
 
     Args:
         user: 用户信息字典（包含 email 和 workcode 字段）
-        headers: 请求头（包含认证信息）
+        token_manager: TokenManager 实例，用于获取有效的认证令牌
         ignore_spec: pathspec.PathSpec 过滤规则对象
+        cutoff_date: UTC datetime object for filtering (None = no filter)
     """
     email = user['email']
     workcode = user['workcode']
@@ -432,7 +539,7 @@ def process_user(user, headers, ignore_spec):
     try:
         user_id = email
 
-        drive_info = get_user_drive(user_id, headers)
+        drive_info = get_user_drive(user_id, token_manager)
 
         if drive_info is None:
             logger.error(f"✗ {workcode} ({email}): 无法获取 Drive")
@@ -441,9 +548,14 @@ def process_user(user, headers, ignore_spec):
 
         log_user_header(workcode, email, drive_id)
 
-        total_files = process_files(drive_id, user_id, workcode, headers, ignore_spec)
+        total_files, total_skipped = process_files(
+            drive_id, user_id, workcode, token_manager, ignore_spec, cutoff_date
+        )
 
-        logger.info(f"用户 {workcode} ({email}) 共处理文件数: {total_files}")
+        logger.info(f"用户 {workcode} ({email}) 处理完成:")
+        logger.info(f"  - 已处理文件数: {total_files}")
+        if cutoff_date:
+            logger.info(f"  - 跳过文件数: {total_skipped} (创建时间早于 {cutoff_date.strftime('%Y-%m-%d')})")
         logger.info("=" * 60)
 
     finally:
@@ -487,21 +599,56 @@ def log_user_header(display_name, upn, drive_id):
 
 def main():
     """主函数"""
-    logger.info("=== 迁移所有用户的 OneDrive 文件 ===")
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='迁移所有用户的 OneDrive 文件，支持增量同步',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 迁移所有文件
+  python sendcmd2sqs-onedrive.py
+
+  # 只迁移2024年1月1日之后创建的文件
+  python sendcmd2sqs-onedrive.py --created-after 2024-01-01
+
+  # 只迁移指定时间之后创建的文件
+  python sendcmd2sqs-onedrive.py --created-after 2024-01-15T10:30:00
+        """
+    )
+    parser.add_argument(
+        '--created-after',
+        type=str,
+        default=None,
+        metavar='DATE',
+        help='只迁移在指定日期之后创建的文件 (ISO 8601格式: YYYY-MM-DD 或 YYYY-MM-DDTHH:MM:SS)'
+    )
+
+    args = parser.parse_args()
+
+    # Validate and parse cutoff date if provided
+    cutoff_date = None
+    if args.created_after:
+        try:
+            cutoff_date = parse_cutoff_date(args.created_after)
+            logger.info(f"=== 增量同步模式: 只迁移 {cutoff_date.strftime('%Y-%m-%d %H:%M:%S UTC')} 之后创建的文件 ===")
+        except ValueError as e:
+            logger.error(f"日期格式错误: {e}")
+            return 1
+    else:
+        logger.info("=== 全量迁移模式: 迁移所有文件 ===")
 
     ignore_spec = load_ignore_patterns()
-
     token_manager = TokenManager()
-
     users = list_users()
 
     for user in users:
-        # 每个用户处理前获取最新的 headers（必要时自动刷新 token）
-        headers = token_manager.get_headers()
-        process_user(user, headers, ignore_spec)
+        # 传递 token_manager 和 cutoff_date
+        process_user(user, token_manager, ignore_spec, cutoff_date)
 
     logger.info(f"所有用户处理完成，日志已上传到: s3://{TARGET_S3_BUCKET}/{LOG_S3_PREFIX}/{TIMESTAMP}/")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    sys.exit(main())

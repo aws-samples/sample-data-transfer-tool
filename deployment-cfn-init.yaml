@@ -276,7 +276,7 @@ Resources:
               command: "curl -s https://rclone.org/install.sh | bash"
               test: "test ! -f /usr/bin/rclone"
             02_install_boto3:
-              command: "pip3 install boto3 requests pathspec"
+              command: "pip3 install boto3 requests pathspec tenacity"
               test: "! python3 -c 'import boto3' 2>/dev/null"
         
         put_files:
@@ -408,8 +408,6 @@ Resources:
                         raise
                 
               mode: "000755"
-              owner: ec2-user
-              group: ec2-user
               owner: ec2-user
               group: ec2-user
             /home/ec2-user/agent/agent.py:
