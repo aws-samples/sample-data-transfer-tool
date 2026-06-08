@@ -55,7 +55,7 @@ def build_handlers(
 ) -> list[logging.Handler]:
     """构造日志 handler 列表（纯函数，不挂到 root，便于单测验证配置）。
 
-    - 轮转文件 handler：全量 INFO+ 写 worker.log（本地排障主力）
+    - 轮转文件 handler：只写 WARNING+ 到 worker.log（CW agent 采集后 CloudWatch 只收 WARNING/ERROR）
     - stderr handler：仅 WARNING+ 转 journald（systemd 快速可见严重问题）
 
     ⚠️ 不返回任何写 stdout 的 handler——stdout 留给 EMF。
@@ -69,7 +69,10 @@ def build_handlers(
         file_handler = RotatingFileHandler(
             log_path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
         )
-        file_handler.setLevel(logging.INFO)
+        # 只写 WARNING+ 到 worker-ops 文件 → CW agent 全量采集该文件,故 CloudWatch
+        # worker-ops 组只收到 WARNING 和 ERROR(连同其多行 stderr/Traceback,单条 record 完整保留)。
+        # 过滤掉 INFO/DIAG(进度计数、bwlimit/tpslimit 刷新)——它们是高频噪音,不进文件也不进 CW。
+        file_handler.setLevel(logging.WARNING)
         file_handler.setFormatter(fmt)
         handlers.append(file_handler)
     except OSError as exc:  # pragma: no cover - 依赖文件系统

@@ -78,14 +78,33 @@ def test_file_handler_rotation_configured(tmp_path):
 
 
 @pytest.mark.unit
-def test_file_handler_actually_writes(tmp_path):
-    log_path = str(tmp_path / "worker.log")
-    handlers = ls.build_handlers(log_path=log_path)
+def test_file_handler_level_is_warning(tmp_path):
+    """文件 handler 级别为 WARNING（收 WARNING/ERROR,过滤 INFO/DIAG）。"""
+    handlers = ls.build_handlers(log_path=str(tmp_path / "worker.log"))
     fh = [h for h in handlers if type(h).__name__ == "RotatingFileHandler"][0]
-    rec = logging.LogRecord("t", logging.INFO, "p", 1, "hello-worker", None, None)
-    fh.emit(rec)
-    fh.flush()
-    assert "hello-worker" in (tmp_path / "worker.log").read_text()
+    assert fh.level == logging.WARNING
+
+
+@pytest.mark.unit
+def test_log_file_keeps_warning_error_drops_info(tmp_path, monkeypatch):
+    """经完整 setup_logging 走 logger 路径：WARNING/ERROR 落文件,INFO 不落。
+
+    用真实 logger.info/warning/error（走 logger 级别判定），而非 handler.handle()
+    （handle 不查 handler.level,只跑 filter——验证级别过滤必须走 logger）。
+    """
+    monkeypatch.setenv("WORKER_LOG_DIR", str(tmp_path))
+    monkeypatch.delenv("WORKER_INDEX", raising=False)   # 用默认 worker.log
+    ls.setup_logging()
+    log = logging.getLogger("leveltest")
+    log.info("info-line-DIAG")
+    log.warning("warn-line")
+    log.error("error-line\nstderr: 429")   # 多行 ERROR
+    for h in logging.getLogger().handlers:
+        h.flush()
+    content = (tmp_path / "worker.log").read_text()
+    assert "error-line" in content and "stderr: 429" in content  # ERROR 含多行续行完整保留
+    assert "warn-line" in content                                 # WARNING 保留
+    assert "info-line-DIAG" not in content                        # INFO 过滤
 
 
 @pytest.mark.unit
