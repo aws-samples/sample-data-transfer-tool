@@ -44,6 +44,12 @@ _UPLOAD_FLAGS = [
     "--s3-upload-concurrency", "8",
     "--buffer-size", "32M",
     "--max-buffer-memory", "2G",
+    # CRC32C 整对象校验和：所有上传默认带，rclone 让 S3 用 CRC32C(FULL_OBJECT)算并
+    # 存进目标对象的原生 ChecksumCRC32C 字段（非 ETag/metadata，需 --checksum-mode
+    # ENABLED 才读得回）。两段式 --header-upload 写法已端到端验证（x86_64/arm64 均生效）。
+    # 需 rclone 支持 CRC32C（自编译版 RcloneS3Key 已含）；官方旧版可能忽略该 header。
+    "--header-upload", "x-amz-checksum-algorithm: CRC32C",
+    "--header-upload", "x-amz-checksum-type: FULL_OBJECT",
 ]
 
 # 两版共有：S3 调优 + 编码一致 + 重试 + 结构化日志（不含 --config，运行时注入路径）。
