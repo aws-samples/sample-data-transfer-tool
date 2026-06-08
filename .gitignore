@@ -1,7 +1,10 @@
-# Deployment parameters with credentials
-deploy-params-cfn-init.json
+# Deployment parameters with credentials（凭证文件绝不入库，仅 .template 占位版可跟踪）
 deploy-params.json
 *-params.json
+deploy-params-smoke.json
+deploy-params-eu.json
+# 例外：占位符模板必须入库供 devops 拷贝填值
+!*.template
 
 # Python
 __pycache__/
@@ -13,6 +16,10 @@ venv/
 env/
 test-debug/
 test-files/
+.coverage
+.pytest_cache/
+htmlcov/
+*.egg-info/
 
 # IDE
 .vscode/
@@ -33,4 +40,9 @@ Thumbs.db
 
 # Work status
 WORK_STATUS.md
-query_drive_id.py
+
+# Local-only design docs & project instructions（主公本地保留，不入库）
+CLAUDE.md
+docs/
+deploy-params-*.json
+!deploy-params-*.json.template

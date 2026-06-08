@@ -1,0 +1,23 @@
+[
+  { "ParameterKey": "VpcId", "ParameterValue": "vpc-REPLACE" },
+  { "ParameterKey": "WorkerSubnetIds", "ParameterValue": "subnet-REPLACE-A,subnet-REPLACE-B" },
+  { "ParameterKey": "GitRepoUrl", "ParameterValue": "https://github.com/aws-samples/sample-data-transfer-tool.git" },
+  { "ParameterKey": "GitBranch", "ParameterValue": "release/gcs-to-s3" },
+  { "ParameterKey": "ProjectTag", "ParameterValue": "gcs-s3-migration" },
+  { "ParameterKey": "GcsHmacSecretArn", "ParameterValue": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:migration-gcs-hmac-XXXXXX" },
+  { "ParameterKey": "ArtifactsBucket", "ParameterValue": "s3euprodloginventory" },
+  { "ParameterKey": "LambdaS3Key", "ParameterValue": "ops/ratelimit-controller-XXXXXXXXXXXX.zip" },
+  { "ParameterKey": "RcloneS3Key", "ParameterValue": "ops/rclone-v1.74.3-x86_64" },
+  { "ParameterKey": "TargetBucketPrefix", "ParameterValue": "migration-dest-" },
+  { "ParameterKey": "RatelimitTargetGbps", "ParameterValue": "300" },
+  { "ParameterKey": "RatelimitTpsTarget", "ParameterValue": "10000" },
+  { "ParameterKey": "InstanceType", "ParameterValue": "m6in.8xlarge" },
+  { "ParameterKey": "CpuArch", "ParameterValue": "x86_64" },
+  { "ParameterKey": "RootVolumeSize", "ParameterValue": "100" },
+  { "ParameterKey": "InstanceCount", "ParameterValue": "1" },
+  { "ParameterKey": "WorkerCount", "ParameterValue": "16" },
+  { "ParameterKey": "WorkerThreads", "ParameterValue": "16" },
+  { "ParameterKey": "KeyPairName", "ParameterValue": "" },
+  { "ParameterKey": "EipPoolTagKey", "ParameterValue": "" },
+  { "ParameterKey": "EipPoolTagValue", "ParameterValue": "" }
+]

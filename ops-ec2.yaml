@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Ops/admin EC2 for the migration cluster fleet. Single host to run day-to-day ops:
+  rate-limit tuning (SSM params), feeding SQS, the migration_cli (inspect/replay/active-workers),
+  reading worker logs/metrics, scaling (ASG), deploying (CFN update/create-stack), packaging the
+  rate-limit Lambda + rclone binary to the artifacts bucket, and SSM-into worker hosts to debug.
+  Access via SSM Session Manager only (no SSH key, no inbound). IAM scoped to migration-* resources.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch the ops host in (same VPC as the clusters).
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet with internet egress (IGW/NAT) so the SSM agent reaches the SSM endpoints.
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: Ops host size (t3.medium is plenty; bump for heavy local feeding).
+  ArtifactsBucket:
+    Type: String
+    Description: Ops/artifacts bucket (Lambda zips + rclone binaries) the host can read/write.
+  TargetBucketPrefix:
+    Type: String
+    Default: migration-dest-
+    Description: Destination-bucket name prefix; host gets read (verify transfers) on arn:aws:s3:::<prefix>*.
+  GitRepoUrl:
+    Type: String
+    Default: https://github.com/aws-samples/sample-data-transfer-tool.git
+    Description: Repo cloned to /opt/migration so you can run bench/feed_s3.py and migration_cli.
+  AssignPublicIp:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: true if SubnetId routes via IGW (needs public IP for SSM); false if NAT private subnet.
+
+Resources:
+  OpsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # SSM Session Manager 进机(无需 SSH);含 ssmmessages/ec2messages/必要 ssm 读。
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ops-perms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ① 限速:读写全部集群的 ratelimit SSM 命名空间。
+              - Sid: RatelimitSSM
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath, ssm:PutParameter]
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/migration/*/ratelimit/*'
+              # ② 灌数据 + ③ 运维CLI(replay):SQS 收发删,限定 migration-* 队列。
+              - Sid: SqsOps
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:SendMessageBatch
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:DeleteMessageBatch
+                  - sqs:GetQueueUrl
+                  - sqs:GetQueueAttributes
+                  - sqs:ListQueues
+                Resource: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:migration-*'
+              # ③ 运维CLI inspect:读 DDB 状态/心跳表(含 Scan 给 active-workers)。
+              - Sid: DynamoOps
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:Scan, dynamodb:DescribeTable]
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/migration-*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/migration-*/index/*'
+              # ⑤ 看日志:Logs Insights / filter,限定 /migration/* 日志组。
+              - Sid: LogsRead
+                Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:StartQuery
+                  - logs:StopQuery
+                  - logs:GetQueryResults
+                Resource: '*'  # StartQuery/Describe 需 *;读取本身无副作用
+              # ⑥ 看监控指标(无 resource 级控制)。
+              - Sid: CloudWatchRead
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:ListDashboards
+                Resource: '*'
+              # ⑦ 扩缩容:改 DesiredCapacity / instance refresh,限定 migration ASG。
+              - Sid: AutoScalingOps
+                Effect: Allow
+                Action:
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:StartInstanceRefresh
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeInstanceRefreshes
+                  - autoscaling:DescribeScalingActivities
+                Resource: '*'  # ASG SetDesiredCapacity 不支持 resource 级,用 * (账号内仅 migration ASG)
+              # ⑧ 部署:CFN 增改查 migration 栈(资源级动作限定 migration* 栈)。
+              - Sid: CloudFormationStackOps
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/migration*/*'
+              # CFN 账号级 API(ListStacks/ValidateTemplate 不支持 resource 级,必须 *)。
+              - Sid: CloudFormationAccountApis
+                Effect: Allow
+                Action: [cloudformation:ListStacks, cloudformation:ValidateTemplate]
+                Resource: '*'
+              # ⑧附:部署要把模板传 S3 + ⑨ 打包 Lambda/rclone 到 artifacts 桶。
+              - Sid: ArtifactsRW
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactsBucket}'
+                  - !Sub 'arn:aws:s3:::${ArtifactsBucket}/*'
+              # ⑪ 验证传输结果:读目标桶(head/list)。
+              - Sid: TargetBucketRead
+                Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation, s3:GetObjectAttributes]
+                Resource:
+                  - !Sub 'arn:aws:s3:::${TargetBucketPrefix}*'
+                  - !Sub 'arn:aws:s3:::${TargetBucketPrefix}*/*'
+              # ⑩ SSM 进 worker 机调试 + 给 worker 发命令(限定 migration 实例靠 tag 在 session 内控)。
+              - Sid: SsmIntoWorkers
+                Effect: Allow
+                Action:
+                  - ssm:StartSession
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                  - ssm:DescribeInstanceInformation
+                  - ssm:TerminateSession
+                  - ssm:ResumeSession
+                  - ec2:DescribeInstances
+                  - autoscaling:DescribeAutoScalingInstances
+                Resource: '*'
+              # CFN 部署 migration 栈时需 PassRole 给 worker/lambda 角色(仅 migration-* 角色)。
+              - Sid: PassMigrationRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/migration*'
+              # CFN 部署 migration 栈会创建/改 IAM、SQS、DDB、Lambda、Logs、ASG、SSM、EC2 等资源,
+              # 这些建栈期的资源管理动作给到(限定常用服务,resource=* 因建栈时资源未知)。
+              - Sid: DeployServiceManage
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagRole
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/migration*'
+              - Sid: DeployOtherServices
+                Effect: Allow
+                Action:
+                  - sqs:CreateQueue
+                  - sqs:DeleteQueue
+                  - sqs:SetQueueAttributes
+                  - sqs:TagQueue
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:UpdateTimeToLive
+                  - dynamodb:TagResource
+                  - dynamodb:DescribeTimeToLive
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:InvokeFunction
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:TagLogGroup
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - events:DescribeRule
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateLaunchTemplate
+                  - ec2:DeleteLaunchTemplate
+                  - ec2:CreateTags
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeLaunchTemplates
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:DescribeImages
+                  - ec2:DescribeKeyPairs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - autoscaling:CreateAutoScalingGroup
+                  - autoscaling:DeleteAutoScalingGroup
+                  - autoscaling:CreateOrUpdateTags
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  - ssm:AddTagsToResource
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
+      Tags:
+        - { Key: Project, Value: gcs-s3-migration }
+        - { Key: Component, Value: ops }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  OpsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref OpsRole]
+
+  OpsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} ops host (egress only; access via SSM)'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: all egress (SSM/AWS APIs/git/pip) }
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-sg' }
+        - { Key: Project, Value: gcs-s3-migration }
+
+  OpsInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      IamInstanceProfile: !Ref OpsInstanceProfile
+      # 子网走 IGW → 需公网 IP 让 SSM agent 到达端点(SG 纯出站,无入站攻击面)。NAT 私有子网设 AssignPublicIp=false。
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: !Ref AssignPublicIp
+          SubnetId: !Ref SubnetId
+          GroupSet: [!GetAtt OpsSecurityGroup.GroupId]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 50, VolumeType: gp3, Encrypted: true }
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf install -y git python3-pip
+          python3 -m pip install boto3 botocore
+          # 拉迁移工具代码,便于直接跑 bench/feed_s3.py、migration_cli。
+          cd /opt && git clone ${GitRepoUrl} migration || true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}' }
+        - { Key: Project, Value: gcs-s3-migration }
+        - { Key: Component, Value: ops }
+
+Outputs:
+  OpsInstanceId:
+    Description: Ops host instance id (connect via SSM Session Manager).
+    Value: !Ref OpsInstance
+  ConnectCmd:
+    Value: !Sub 'aws ssm start-session --region ${AWS::Region} --target ${OpsInstance}'
+  OpsRoleArn:
+    Value: !GetAtt OpsRole.Arn

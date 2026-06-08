@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcs-s3-migration"
+version = "0.1.0"
+description = "Distributed S3/GCS-to-S3 file transfer tool over an SQS work queue"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.34",
+    "pathspec>=0.12",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "bench"]
+addopts = "-q"
+markers = [
+    "unit: 单元测试",
+    "integration: 集成测试（moto mock AWS）",
+]
+
+[tool.coverage.run]
+source = ["migration"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501"]

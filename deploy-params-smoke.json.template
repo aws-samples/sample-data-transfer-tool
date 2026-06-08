@@ -1,0 +1,66 @@
+[
+  {
+    "ParameterKey": "VpcId",
+    "ParameterValue": "vpc-xxxxxxxxxxxxxxxxx"
+  },
+  {
+    "ParameterKey": "WorkerSubnetIds",
+    "ParameterValue": "subnet-aaaaaaaaaaaaaaaaa,subnet-bbbbbbbbbbbbbbbbb"
+  },
+  {
+    "ParameterKey": "InstanceType",
+    "ParameterValue": "c8gn.8xlarge"
+  },
+  {
+    "ParameterKey": "CpuArch",
+    "ParameterValue": "arm64"
+  },
+  {
+    "ParameterKey": "RootVolumeSize",
+    "ParameterValue": "100"
+  },
+  {
+    "ParameterKey": "InstanceCount",
+    "ParameterValue": "2"
+  },
+  {
+    "ParameterKey": "KeyPairName",
+    "ParameterValue": "your-keypair-name"
+  },
+  {
+    "ParameterKey": "WorkerThreads",
+    "ParameterValue": "64"
+  },
+  {
+    "ParameterKey": "RcloneExtraFlags",
+    "ParameterValue": "--disable copy"
+  },
+  {
+    "ParameterKey": "GcsHmacAccessKeyId",
+    "ParameterValue": "GOOG_REPLACE_WITH_YOUR_HMAC_ACCESS_KEY"
+  },
+  {
+    "ParameterKey": "GcsHmacSecretAccessKey",
+    "ParameterValue": "REPLACE_WITH_YOUR_HMAC_SECRET"
+  },
+  {
+    "ParameterKey": "TargetS3Bucket",
+    "ParameterValue": "your-destination-bucket"
+  },
+  {
+    "ParameterKey": "DestinationPrefix",
+    "ParameterValue": "bench/migrated"
+  },
+  {
+    "ParameterKey": "GitRepoUrl",
+    "ParameterValue": "https://github.com/aws-samples/sample-data-transfer-tool.git"
+  },
+  {
+    "ParameterKey": "GitBranch",
+    "ParameterValue": "release/gcs-to-s3"
+  },
+  {
+    "ParameterKey": "RatelimitTargetGbps",
+    "ParameterValue": "600"
+  }
+]
