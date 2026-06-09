@@ -175,16 +175,29 @@ def _get(ssm, name: str, default: str = "") -> str:
 
 
 def _network_in_gbps(cw, asg: str, window_sec: int) -> float:
+    """ASG 的 EC2 NetworkIn 平均 Gbps(取最近一个**完整**周期桶)。
+
+    根因修复(部分桶假尖峰):CloudWatch 的 Sum 桶按 epoch 对齐(60s 桶在 :00/:01...,
+    300s 桶在 :00/:05...),而 EndTime=now 几乎不落在桶边界上 → 返回结果里**最后一个桶
+    是"部分填充"**:它只累积了 now 之前已过去那几秒的字节,却仍 ÷ 完整 window_sec →
+    被严重低估,且 window 越大低估越狠。旧实现取 [-1](部分桶)使 actual(300s)比
+    spike(60s)虚低约 window 比(实测 5×),凭空制造 spike≫actual 的假尖峰 → 误触
+    fast-brake(spike>target×1.2)把 bwlimit 砸到地板、进程饿死。
+    修法:多查一个 window 余量(StartTime 回退 2×window),取**倒数第二个完整桶**,
+    丢弃部分填充的最后桶。数据点不足 2 个时退回用仅有的桶(冷启动容错)。
+    NetworkIn 是 period 累积字节,Gbps = Sum ÷ period × 8 ÷ 1e9(非 Average×8/1e9)。
+    """
     now = int(time.time())
     res = cw.get_metric_statistics(
         Namespace="AWS/EC2", MetricName="NetworkIn",
         Dimensions=[{"Name": "AutoScalingGroupName", "Value": asg}],
-        StartTime=now - window_sec - 60, EndTime=now, Period=window_sec, Statistics=["Sum"],
+        StartTime=now - window_sec * 2 - 60, EndTime=now, Period=window_sec, Statistics=["Sum"],
     )
-    pts = res.get("Datapoints", [])
+    pts = sorted(res.get("Datapoints", []), key=lambda p: p["Timestamp"])
     if not pts:
         return 0.0
-    pt = sorted(pts, key=lambda p: p["Timestamp"])[-1]
+    # 倒数第二个 = 最近一个已走完的完整桶;只有一个桶时只能用它(数据不足容错)。
+    pt = pts[-2] if len(pts) >= 2 else pts[-1]
     return pt["Sum"] / window_sec * _BITS_PER_BYTE / _GIGA
 
 

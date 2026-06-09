@@ -45,21 +45,28 @@ def list_source_keys(s3, bucket: str, prefix: str) -> list[str]:
 
 
 def build_entry(*, src_bucket: str, key: str, dest_bucket: str, dest_prefix: str,
-                run_id: str, worker_id: int, seq: int) -> dict:
+                run_id: str, worker_id: int, seq: int,
+                rclone_args: list[str] | None = None) -> dict:
     """构造单条 S3→S3 copy 的 SQS batch entry(纯函数,易测)。
 
     source = s3:<src_bucket>/<key>;destination 拼 run_id/worker/seq 保证唯一。
+    rclone_args 非空时随消息下发(经 worker 白名单过滤);压测常用 ["--disable","copy"]
+    强制 S3→S3 走下载+上传(数据流经 worker 网卡),否则默认 server-side copy 不过本机、
+    NetworkIn=0(限速控制器测不到流量)。
     """
     name = key.rsplit("/", 1)[-1]
     body = {
         "source": f"s3:{src_bucket}/{key}",
         "destination": f"s3:{dest_bucket}/{dest_prefix}/run_{run_id}/w{worker_id}_{seq}/{name}",
     }
+    if rclone_args:
+        body["rclone_args"] = rclone_args
     return {"Id": f"w{worker_id}n{seq}", "MessageBody": json.dumps(body)}
 
 
 def feeder(*, worker_id: int, region: str, queue_url: str, keys: list[str],
-           src_bucket: str, dest_bucket: str, dest_prefix: str, rounds: int) -> None:
+           src_bucket: str, dest_bucket: str, dest_prefix: str, rounds: int,
+           rclone_args: list[str] | None = None) -> None:
     """单线程:把分到的 key 组 10 条 batch 发,跑 rounds 轮(或被 stop)。"""
     sqs = _sqs_client(region)
     n = 0
@@ -74,6 +81,7 @@ def feeder(*, worker_id: int, region: str, queue_url: str, keys: list[str],
             entries.append(build_entry(
                 src_bucket=src_bucket, key=key, dest_bucket=dest_bucket,
                 dest_prefix=dest_prefix, run_id=_RUN_ID, worker_id=worker_id, seq=n,
+                rclone_args=rclone_args,
             ))
             n += 1
         if not entries:
@@ -96,7 +104,13 @@ def main() -> None:
     ap.add_argument("--region", default="eu-south-2")
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--rounds", type=int, default=1, help="每个源对象灌几轮(dest key 含轮次,不撞)")
+    ap.add_argument("--disable-server-side-copy", action="store_true",
+                    help="消息带 --disable copy,强制 S3→S3 走下载+上传(数据过 worker 网卡,"
+                         "产生 NetworkIn);否则默认 server-side copy 不过本机、限速器测不到流量")
     args = ap.parse_args()
+
+    # 压测:--disable copy 让数据流经 worker(否则 S3 内部 CopyObject,NetworkIn=0)。
+    rclone_args = ["--disable", "copy"] if args.disable_server_side_copy else None
 
     s3 = boto3.client("s3", region_name=args.region)
     sqs = _sqs_client(args.region)
@@ -116,7 +130,7 @@ def main() -> None:
         futs = [
             pool.submit(feeder, worker_id=w, region=args.region, queue_url=queue_url,
                         keys=chunks[w], src_bucket=args.src_bucket, dest_bucket=args.dest_bucket,
-                        dest_prefix=args.dest_prefix, rounds=args.rounds)
+                        dest_prefix=args.dest_prefix, rounds=args.rounds, rclone_args=rclone_args)
             for w in range(args.threads) if chunks[w]
         ]
         # 进度打印
