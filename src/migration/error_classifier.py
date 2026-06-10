@@ -84,6 +84,20 @@ _TRANSIENT_ERROR = re.compile(
 )
 
 
+# 零传输假成功：源不存在 + 目标端也无同名文件时，rclone 把单对象 copyto 退化为
+# 父目录空同步 → 输出 "There was nothing to transfer" 并 exit 0。历史上被记
+# SUCCESS(bytes=0) 直接删消息——永不重试、无告警、无 DLQ 留底（数据完整性盲点，
+# 2026-06-10 测试栈实测确认）。runner 据此把 exit 0 + transfers==0 + 此消息的
+# COPY 结果降级 FATAL。合法零传输不受影响：目录消息已被 directory_path poison
+# 拦在 rclone 之前；目标已有相同文件的重跑走 "Unchanged skipping" 不是本消息。
+_NOTHING_TO_TRANSFER = re.compile(r"there was nothing to transfer", re.IGNORECASE)
+
+
+def is_nothing_to_transfer(stderr: str) -> bool:
+    """stderr 是否含 rclone 的"无可传输"消息（源不存在的 exit-0 假成功标记）。"""
+    return bool(_NOTHING_TO_TRANSFER.search(stderr or ""))
+
+
 # 源对象不存在：rclone copyto 源缺失时走 cmd/cmd.go 的 generic critical 路径，
 # 以退出码 1 退出（不是 3/4），消息为 "Source doesn't exist or is a directory and
 # destination is a file"。1 不在 _STATE_BY_EXIT_CODE → UNKNOWN → 不删不计数、

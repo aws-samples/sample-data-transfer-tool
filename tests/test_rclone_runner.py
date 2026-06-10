@@ -634,6 +634,49 @@ class TestRun:
         assert res.exit_code == 1
         assert res.error_class == "src_not_found"
 
+    def test_nothing_to_transfer_downgraded_success_to_fatal(self):
+        # 盲点修复（2026-06-10）：源不存在 + 目标端也无同名文件时，rclone 把单对象
+        # copyto 退化为父目录空同步 → "There was nothing to transfer" + exit 0 →
+        # 历史上被记 SUCCESS(bytes=0) 直接删消息，永不重试、无 DLQ 留底。
+        # 现降级 FATAL + src_not_found（走快速重投烧进 DLQ）。
+        # stderr 为 2026-06-10 测试栈抓到的真实输出。
+        stderr = (
+            b'{"time":"2026-06-10T07:02:31.193937976Z","level":"info",'
+            b'"msg":"Starting bandwidth limiter at 1.118Gi Byte/s",'
+            b'"source":"accounting/token_bucket.go:109"}\n'
+            b'{"time":"2026-06-10T07:02:31.30109992Z","level":"info",'
+            b'"msg":"There was nothing to transfer","source":"sync/sync.go:1019"}\n'
+            b'{"time":"2026-06-10T07:02:31.301227912Z","level":"notice",'
+            b'"msg":"...","stats":{"bytes":0,"elapsedTime":0.013,"errors":0,'
+            b'"transfers":0,"speed":0}}'
+        )
+        runner = make_runner(returncode=0, stderr=stderr)
+        res = run(msg(), "/cfg/rclone.conf", is_large=False, runner=runner)
+        assert res.state is State.FATAL
+        assert res.exit_code == 0
+        assert res.error_class == "src_not_found"
+
+    def test_real_zero_byte_transfer_stays_success(self):
+        # 对照：真实传输了 1 个对象（哪怕 0 字节文件）transfers=1 → 仍 SUCCESS，
+        # 不被误降级。
+        stderr = (
+            b'{"level":"notice","msg":"...","stats":{"bytes":0,"elapsedTime":0.5,'
+            b'"errors":0,"transfers":1,"speed":0}}'
+        )
+        runner = make_runner(returncode=0, stderr=stderr)
+        res = run(msg(), "/cfg/rclone.conf", is_large=False, runner=runner)
+        assert res.state is State.SUCCESS
+
+    def test_delete_op_not_affected_by_nothing_to_transfer(self):
+        # 对照：op=DELETE 即使 stderr 异常也不走本降级（delete 有自己的幂等链路）。
+        from migration.models import Op, TransferMessage
+        del_msg = TransferMessage(
+            source="", destination="s3:bucket/x.bin", op=Op.DELETE
+        )
+        runner = make_runner(returncode=0, stderr=b"")
+        res = run(del_msg, "/cfg/rclone.conf", is_large=False, runner=runner)
+        assert res.state is State.SUCCESS
+
     def test_real_crash_stays_unknown(self):
         # 对照：真正的崩溃（SIGKILL，退出码 137，stderr 无瞬时关键词）仍保持 UNKNOWN，
         # 不被误升级。用真实分类器。

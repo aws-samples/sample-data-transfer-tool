@@ -421,8 +421,9 @@ def run(
     # in-flight 涨到数万的真因）。但 429/5xx/网络中断本质是瞬时错误，应判 RETRYABLE
     # （计数 + 自然重投 + maxReceiveCount 后进 DLQ）。仅在 UNKNOWN 且 stderr 命中瞬时
     # 错误时升级；真正的崩溃/SIGKILL（stderr 不含这些关键词）仍保持 UNKNOWN。
+    from . import error_classifier
+
     if state is State.UNKNOWN:
-        from . import error_classifier
         if error_classifier.is_source_missing(stderr):
             # 源不存在（copyto 走 generic critical 路径退出码 1）= 确定性终态，
             # 重试永远不会成功 → FATAL（删消息 + 计数），不空占 visibility 重投。
@@ -430,10 +431,22 @@ def run(
         elif error_classifier.is_transient_error(stderr):
             state = State.RETRYABLE
 
+    # 零传输假成功降级（2026-06-10）：源不存在 + 目标端也无同名文件时 rclone 把
+    # 单对象 copyto 退化为父目录空同步 → "There was nothing to transfer" + exit 0。
+    # 真实传输 transfers>=1，空同步 transfers==0 → 降级 FATAL + src_not_found
+    # （DDB 记 body，走快速重投烧进 DLQ 留底），不再静默记 SUCCESS 删消息。
+    if (
+        state is State.SUCCESS
+        and msg.op is Op.COPY
+        and stats.transfers == 0
+        and error_classifier.is_nothing_to_transfer(stderr)
+    ):
+        state = State.FATAL
+        error_class = "src_not_found"
+
     # delete 幂等：目标已不存在（404/not found）→ 期望状态已达成，强制 SUCCESS，
     # 避免对象不存在被当 FATAL 反复重投进 DLQ。仅 op=DELETE 路径生效。
     if msg.op is Op.DELETE and returncode != 0:
-        from . import error_classifier
         if error_classifier.is_delete_noop(stderr):
             state = State.SUCCESS
             error_class = None
