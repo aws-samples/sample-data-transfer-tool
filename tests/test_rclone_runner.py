@@ -614,6 +614,26 @@ class TestRun:
         assert res.exit_code == 1
         assert res.error_class == "src_rate_limit"
 
+    def test_source_missing_upgraded_unknown_to_fatal(self):
+        # 根因修复：源对象不存在时 rclone copyto 走 cmd/cmd.go 的 generic critical
+        # 路径以退出码 1 退出（不是 3/4）→ classify_state(1)=UNKNOWN → 不删不计数、
+        # 空占 12h visibility × 3 次（36h）才进 DLQ。但"源不存在"是确定性终态，
+        # 重试永远不会成功，应升级 FATAL（删消息 + 计数 + DDB 记 src_not_found）。
+        # stderr 为 2026-06-10 生产真实日志。用真实分类器验证 run() 内的升级逻辑。
+        stderr = (
+            b'{"time":"2026-06-10T05:37:09.549882929Z","level":"info",'
+            b'"msg":"Starting bandwidth limiter at 9.540Mi Byte/s",'
+            b'"source":"accounting/token_bucket.go:109"}\n'
+            b'{"time":"2026-06-10T05:37:09.722089965Z","level":"critical",'
+            b'"msg":"Source doesn\'t exist or is a directory and destination is a file",'
+            b'"source":"cmd/cmd.go:204"}'
+        )
+        runner = make_runner(returncode=1, stderr=stderr)
+        res = run(msg(), "/cfg/rclone.conf", is_large=False, runner=runner)
+        assert res.state is State.FATAL
+        assert res.exit_code == 1
+        assert res.error_class == "src_not_found"
+
     def test_real_crash_stays_unknown(self):
         # 对照：真正的崩溃（SIGKILL，退出码 137，stderr 无瞬时关键词）仍保持 UNKNOWN，
         # 不被误升级。用真实分类器。

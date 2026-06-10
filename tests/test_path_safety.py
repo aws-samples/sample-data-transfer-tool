@@ -36,6 +36,22 @@ class TestValidateObjectPath:
         assert not ok
         assert reason == "empty"
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # 目录型路径（2026-06-10 决策）：尾部 / = 前缀/目录，不是单对象。
+            # copyto 会整树复制（实测 220 个对象副作用）、deletefile 会失败。
+            # 一律按 poison 拦截：ERROR 日志 + 快速重投 3 次进 DLQ。
+            "libs/hive/warehouse/aml.db/aml_item_fea_mid_dev_all/dt=20250724/days=30/",
+            "prefix/",
+            "a/b/c/",
+        ],
+    )
+    def test_rejects_directory_path(self, name):
+        ok, reason = validate_object_path(name)
+        assert not ok
+        assert reason == "directory_path"
+
     def test_rejects_too_long_utf8(self):
         # 1025 ASCII bytes > 1024 limit（对象 key 字节数上限）
         ok, reason = validate_object_path("a" * 1025)

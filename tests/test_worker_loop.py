@@ -27,6 +27,7 @@ class FakeSQS:
         self._batches = list(batches)
         self.deleted = []
         self.visibility_batches = []  # 记录 change_message_visibility_batch 调用
+        self.visibility_changes = []  # 记录单条 change_message_visibility (receipt, timeout)
         self._lock = __import__("threading").Lock()
 
     def receive_message(self, **kw):
@@ -43,6 +44,10 @@ class FakeSQS:
         with self._lock:
             self.visibility_batches.append(Entries)
         return {"Successful": [{"Id": e["Id"]} for e in Entries], "Failed": []}
+
+    def change_message_visibility(self, QueueUrl, ReceiptHandle, VisibilityTimeout):
+        with self._lock:
+            self.visibility_changes.append((ReceiptHandle, VisibilityTimeout))
 
 
 @pytest.fixture(autouse=True)
@@ -91,6 +96,48 @@ def test_poll_once_retryable_keeps_message(monkeypatch):
     loop.poll_once()
     assert sqs.deleted == []                 # RETRYABLE keeps message
     assert loop.stats["failed"] == 1
+
+
+def test_poll_once_retryable_requeues_with_backoff(monkeypatch):
+    """失败快速重投：RETRYABLE(src_rate_limit) → change_message_visibility(300)，
+    不再等 12h 自然过期；ReceiveCount 照常累积，3 次后进 DLQ。"""
+    monkeypatch.setattr(worker_mod.rclone_runner, "run", _retry)
+    sqs = FakeSQS([[_msg("r1")]])
+    loop = WorkerLoop(_settings(), "http://large", "i-1", sqs=sqs)
+    loop.poll_once()
+    assert sqs.visibility_changes == [("r1", 300)]   # 限流退避 300s
+
+
+def test_poll_once_unknown_requeues_immediately(monkeypatch):
+    monkeypatch.setattr(worker_mod.rclone_runner, "run", _unknown)
+    sqs = FakeSQS([[_msg("r1")]])
+    loop = WorkerLoop(_settings(), "http://large", "i-1", sqs=sqs)
+    loop.poll_once()
+    assert sqs.visibility_changes == [("r1", 0)]     # 立即重投
+
+
+def test_poll_once_success_does_not_touch_visibility(monkeypatch):
+    monkeypatch.setattr(worker_mod.rclone_runner, "run", _ok)
+    sqs = FakeSQS([[_msg("r1")]])
+    loop = WorkerLoop(_settings(), "http://large", "i-1", sqs=sqs)
+    loop.poll_once()
+    assert sqs.visibility_changes == []              # 成功只删，不改 visibility
+
+
+def test_requeue_failure_falls_back_to_natural_redelivery(monkeypatch):
+    """change_message_visibility 失败（节流/receipt 过期）不抛出——
+    消息退化为 12h 自然过期重投（原行为），单独计数便于观测。"""
+    monkeypatch.setattr(worker_mod.rclone_runner, "run", _retry)
+    sqs = FakeSQS([[_msg("r1")]])
+
+    def boom(**kw):
+        raise RuntimeError("throttled")
+
+    sqs.change_message_visibility = boom
+    loop = WorkerLoop(_settings(), "http://large", "i-1", sqs=sqs)
+    loop.poll_once()                                  # 不得抛异常
+    assert loop.stats["requeue_fail"] == 1
+    assert loop.stats["failed"] == 1                  # 计数不受影响
 
 
 def test_poll_once_empty_returns_zero():
@@ -313,20 +360,21 @@ def test_ratelimit_loop_refreshes_both_bwlimit_and_tpslimit(monkeypatch):
 
 def test_poison_message_records_fatal_and_keeps_for_dlq(monkeypatch):
     """Malformed body: record a FATAL terminal (traceable) but KEEP message →
-    自然重投 3 次后 SQS 转 DLQ（处理不了的消息不直接删，留底可 replay）。"""
+    快速重投烧满 3 次 ReceiveCount 后 SQS 转 DLQ（不直接删，留底可 replay）。"""
     recorded = {}
 
-    def capture_record(*, source, attempt_timestamp, result, instance_id):
+    def capture_record(*, source, attempt_timestamp, result, instance_id, message_body=None):
         recorded["source"] = source
         recorded["state"] = result.state
         recorded["error_class"] = result.error_class
+        recorded["message_body"] = message_body
 
     monkeypatch.setattr(worker_mod.status_store, "record_terminal",
                         lambda *a, **k: capture_record(**k) if False else None)
     # use process_message directly for clarity
     from migration.models import State
     from migration.worker import process_message
-    spy = {"deleted": False}
+    spy = {"deleted": False, "requeues": []}
     out = process_message(
         body="{bad json",
         object_size=1024,
@@ -339,13 +387,16 @@ def test_poison_message_records_fatal_and_keeps_for_dlq(monkeypatch):
         delete_fn=lambda: spy.update(deleted=True),
         record_fn=lambda **k: capture_record(**k),
         report_fn=lambda *a, **k: None,
+        requeue_fn=lambda delay: spy["requeues"].append(delay),
     )
     assert out.state is State.FATAL
     assert out.counted is False
-    assert spy["deleted"] is False                      # poison 不删 → 留队列待 DLQ
+    assert spy["deleted"] is False                      # poison 不删 → 快速烧向 DLQ
+    assert spy["requeues"] == [0]                       # 立即重投
     assert recorded["state"] is State.FATAL             # 但先记一条终态
     assert recorded["source"].startswith("poison:")     # traceable source
     assert recorded["error_class"] == "poison_message"
+    assert recorded["message_body"] == "{bad json"      # 完整原始消息体进 DDB
 
 
 # ── H1: 优雅退出（in-flight 集合 + shutdown 重置 visibility）─────────────────

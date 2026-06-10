@@ -146,6 +146,46 @@ def test_record_terminal_failure_carries_error_fields(ddb):
 
 
 @pytest.mark.integration
+def test_record_terminal_carries_message_body(ddb):
+    """出错消息（2026-06-10 决策）：DDB 记录完整原始消息体，便于直接 replay/排查。"""
+    source = "gcs:eu-abc-dw/libs/x/part-1.orc"
+    body = (
+        '{"source":"gcs:eu-abc-dw/libs/x/part-1.orc",'
+        '"destination":"s3:s3euprodabcdw/libs/x/part-1.orc"}'
+    )
+    record_terminal(
+        ddb,
+        STATUS_TABLE,
+        source,
+        "2026-06-10T08:00:00+00:00",
+        _result(state=State.FATAL, exit_code=1, error_class="src_not_found",
+                error_message="Source doesn't exist"),
+        instance_id="i-xyz",
+        now_iso="2026-06-10T08:00:01+00:00",
+        message_body=body,
+    )
+    row = inspect(ddb, STATUS_TABLE, source)[0]
+    assert row["message_body"] == body
+
+
+@pytest.mark.integration
+def test_record_terminal_no_message_body_when_omitted(ddb):
+    """不传 message_body（SUCCESS 路径）→ 不写该属性。"""
+    source = "onedrive:nobody.txt"
+    record_terminal(
+        ddb,
+        STATUS_TABLE,
+        source,
+        "2026-06-10T08:10:00+00:00",
+        _result(),
+        instance_id="i-ok",
+        now_iso="2026-06-10T08:10:01+00:00",
+    )
+    row = inspect(ddb, STATUS_TABLE, source)[0]
+    assert "message_body" not in row
+
+
+@pytest.mark.integration
 def test_record_terminal_no_error_fields_when_success(ddb):
     """SUCCESS 时不写 error_class/error_message（避免空属性污染）。"""
     source = "onedrive:ok.txt"

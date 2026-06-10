@@ -14,7 +14,9 @@ from migration.error_classifier import (
     classify_error,
     classify_state,
     is_delete_noop,
+    is_source_missing,
     is_transient_error,
+    retry_delay_seconds,
 )
 from migration.models import State
 
@@ -98,6 +100,72 @@ def test_is_transient_error_false(stderr: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# is_source_missing：源对象不存在（确定性终态，重试无用 → FATAL）
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # rclone copyto 源缺失的 critical 消息（cmd/cmd.go generic 路径，退出码 1）
+        "Source doesn't exist or is a directory and destination is a file",
+        # 真实 --use-json-log 输出（含 info 行 + critical 行）
+        '{"time":"2026-06-10T05:37:09.5Z","level":"info","msg":"Starting bandwidth limiter"}\n'
+        '{"time":"2026-06-10T05:37:09.7Z","level":"critical",'
+        '"msg":"Source doesn\'t exist or is a directory and destination is a file",'
+        '"source":"cmd/cmd.go:204"}',
+        "source does not exist",
+    ],
+)
+def test_is_source_missing_true(stderr: str) -> None:
+    # 源不存在 = 确定性终态（上游清单超前于实际数据等），重试永远不会成功
+    assert is_source_missing(stderr) is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "",
+        "429 too many requests",
+        "403 permissionDenied",
+        "directory not found",  # 退出码 3 的 FATAL 路径，不属于本识别器
+        "destination file exists",
+        "signal: killed",
+    ],
+)
+def test_is_source_missing_false(stderr: str) -> None:
+    # 限流/权限/崩溃等不是"源不存在"，不应被误判 FATAL
+    assert is_source_missing(stderr) is False
+
+
+# ---------------------------------------------------------------------------
+# retry_delay_seconds：失败快速重投的分级延迟（按 error_class）
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("error_class", "expected"),
+    [
+        # 限流类：给源端恢复窗口，避免 0 秒连打 3 次把可救消息假性打进 DLQ
+        ("src_rate_limit", 300),
+        # 5xx：短退避
+        ("src_5xx", 60),
+        ("dst_5xx", 60),
+        # 确定性终态/崩溃/未知：立即重投，快速烧完 3 次进 DLQ 留底
+        ("src_not_found", 0),
+        ("src_acl_deny", 0),
+        ("arg_error", 0),
+        ("poison_message", 0),
+        ("worker_oom", 0),
+        ("rclone_timeout", 0),
+        ("uncategorized", 0),
+        (None, 0),
+    ],
+)
+def test_retry_delay_seconds(error_class: str | None, expected: int) -> None:
+    assert retry_delay_seconds(error_class) == expected
+
+
+# ---------------------------------------------------------------------------
 # classify_state：退出码 → 四态
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
@@ -154,9 +222,14 @@ def test_classify_error_success_returns_none() -> None:
         ("Failed to copy: googleapi: Error 403: permissionDenied", "src_acl_deny"),
         ("HTTP error 403 Forbidden on source", "src_acl_deny"),
         ("error: permissionDenied while reading object", "src_acl_deny"),
-        # src_not_found：404 / notFound
+        # src_not_found：404 / notFound / doesn't exist
         ("googleapi: Error 404: notFound", "src_not_found"),
         ("HTTP 404 object does not exist", "src_not_found"),
+        # rclone copyto 源缺失 critical 消息（退出码 1）也应标 src_not_found 而非 uncategorized
+        (
+            "Source doesn't exist or is a directory and destination is a file",
+            "src_not_found",
+        ),
         # src_rate_limit：429
         ("googleapi: Error 429: rateLimitExceeded", "src_rate_limit"),
         ("Too Many Requests (429) from source", "src_rate_limit"),

@@ -423,7 +423,11 @@ def run(
     # 错误时升级；真正的崩溃/SIGKILL（stderr 不含这些关键词）仍保持 UNKNOWN。
     if state is State.UNKNOWN:
         from . import error_classifier
-        if error_classifier.is_transient_error(stderr):
+        if error_classifier.is_source_missing(stderr):
+            # 源不存在（copyto 走 generic critical 路径退出码 1）= 确定性终态，
+            # 重试永远不会成功 → FATAL（删消息 + 计数），不空占 visibility 重投。
+            state = State.FATAL
+        elif error_classifier.is_transient_error(stderr):
             state = State.RETRYABLE
 
     # delete 幂等：目标已不存在（404/not found）→ 期望状态已达成，强制 SUCCESS，

@@ -103,6 +103,23 @@ class TestParseMessageBody:
         with pytest.raises(ValueError):
             parse_message_body(body)
 
+    @pytest.mark.parametrize(
+        "body_dict",
+        [
+            # 类型混淆（审查 HIGH-1）：非字符串字段必须抛 ValueError 走 poison 链路，
+            # 不能抛 TypeError 逃逸到 swallowed（DDB 无终态记录）
+            {"source": 42, "destination": "s3:b/y"},
+            {"source": "s3src:a/x", "destination": None},
+            {"source": "s3src:a/x", "destination": ["s3:b/y"]},
+            {"source": "s3src:a/x", "destination": "s3:b/y", "rclone_args": 42},
+            {"source": "s3src:a/x", "destination": "s3:b/y", "rclone_args": "--progress"},
+            {"source": "s3src:a/x", "destination": "s3:b/y", "rclone_args": [1, 2]},
+        ],
+    )
+    def test_wrong_field_types_raise_value_error(self, body_dict):
+        with pytest.raises(ValueError):
+            parse_message_body(json.dumps(body_dict))
+
 
 # ─────────────────────────── is_large_object ───────────────────────────────
 class TestIsLargeObject:
@@ -135,6 +152,7 @@ class _Spy:
         self.deleted = False
         self.recorded = None
         self.reported = None
+        self.requeues = []  # 每次 requeue_fn 调用的 delay 秒数
 
     def delete(self):
         self.deleted = True
@@ -144,6 +162,9 @@ class _Spy:
 
     def report(self, event, **kw):
         self.reported = event
+
+    def requeue(self, delay):
+        self.requeues.append(delay)
 
 
 def _process(state, spy, *, is_large=False, error_class=None, error_message=None):
@@ -164,6 +185,7 @@ def _process(state, spy, *, is_large=False, error_class=None, error_message=None
         delete_fn=spy.delete,
         record_fn=spy.record,
         report_fn=spy.report,
+        requeue_fn=spy.requeue,
     )
 
 
@@ -175,6 +197,7 @@ class TestProcessMessageFourStates:
         assert spy.deleted is True            # SUCCESS → delete message
         assert spy.recorded is not None        # recorded terminal state
         assert spy.reported is not None        # monitoring reported
+        assert spy.requeues == []              # 成功不重投
         assert result.counted is True
 
     def test_reported_event_carries_partition_fields(self):
@@ -186,26 +209,49 @@ class TestProcessMessageFourStates:
         assert spy.reported["hour"] == "00"            # now_iso[11:13]
         assert spy.reported["event_time"] == "2026-05-20T00:00:00"
 
-    def test_retryable_keeps_message(self):
+    def test_retryable_requeues_with_rate_limit_backoff(self):
+        # 失败快速重投（2026-06-10 决策）：不删 + 立即改 visibility 丢回队列。
+        # 限流类给 300s 退避（0 秒连打 3 次会把可救消息假性打进 DLQ）。
         spy = _Spy()
         result = _process(State.RETRYABLE, spy, error_class="src_rate_limit")
-        assert spy.deleted is False            # RETRYABLE → keep (visibility re-deliver)
+        assert spy.deleted is False            # 不删，留 ReceiveCount 烧向 DLQ
         assert spy.recorded is not None        # still record FAILED
+        assert spy.requeues == [300]           # 限流退避 300s 后可见
         assert result.counted is True
 
-    def test_fatal_keeps_message_and_records(self):
+    def test_failure_records_full_message_body(self):
+        # 出错消息 DDB 记录完整消息体（2026-06-10 决策）
+        spy = _Spy()
+        _process(State.FATAL, spy, error_class="src_not_found")
+        assert spy.recorded["message_body"] is not None
+        assert '"source": "s3src:a/x"' in spy.recorded["message_body"]
+
+    def test_success_does_not_record_message_body(self):
+        # SUCCESS 不存 body（百万级成功行省 DDB 容量）
+        spy = _Spy()
+        _process(State.SUCCESS, spy)
+        assert spy.recorded["message_body"] is None
+
+    def test_fatal_requeues_immediately(self):
         spy = _Spy()
         result = _process(State.FATAL, spy, error_class="src_not_found")
-        # FATAL 不删：靠自然重投 3 次后 SQS 转 DLQ（处理不了的留底、可 replay）
+        # FATAL 不删：快速重投烧满 3 次 ReceiveCount 进 DLQ 留底（分钟级，非 36h）
         assert spy.deleted is False
         assert spy.recorded is not None
+        assert spy.requeues == [0]             # 确定性终态 0 秒立即重投
         assert result.counted is True
 
-    def test_unknown_does_not_delete_and_does_not_count(self):
+    def test_unknown_requeues_immediately_and_does_not_count(self):
         spy = _Spy()
         result = _process(State.UNKNOWN, spy)
         assert spy.deleted is False            # UNKNOWN → keep, no count (critical fix)
+        assert spy.requeues == [0]             # 快速重投，不再空占 12h visibility
         assert result.counted is False
+
+    def test_retryable_5xx_requeues_with_short_backoff(self):
+        spy = _Spy()
+        _process(State.RETRYABLE, spy, error_class="src_5xx")
+        assert spy.requeues == [60]            # 5xx 给 60s 短退避
 
     def test_report_event_has_no_high_cardinality_source_in_dimensions(self):
         # The monitoring event may carry source in the body (detail layer),
@@ -273,7 +319,7 @@ class TestProcessMessageRcloneErrorLogging:
 class TestProcessMessageBadBody:
     def test_malformed_body_does_not_delete(self):
         """Unparseable/invalid body → poison：记一条 FATAL 终态(可追溯)，但**不删**，
-        靠自然重投 3 次后由 SQS 转入 DLQ。处理不了的消息绝不直接删，保证可 replay。"""
+        快速重投烧满 3 次 ReceiveCount 后由 SQS 转入 DLQ。绝不直接删，保证可 replay。"""
         spy = _Spy()
         result = process_message(
             body="{bad json",
@@ -287,11 +333,99 @@ class TestProcessMessageBadBody:
             delete_fn=spy.delete,
             record_fn=spy.record,
             report_fn=spy.report,
+            requeue_fn=spy.requeue,
         )
         assert result.state is State.FATAL  # malformed = poison, classify FATAL
-        assert spy.deleted is False         # 不删 → 留队列待 DLQ
+        assert spy.deleted is False         # 不删 → 快速烧向 DLQ
         assert spy.recorded is not None     # 但先记一条终态(含 poison: source 可查)
+        assert spy.requeues == [0]          # poison 立即重投
         assert result.counted is False
+
+
+class TestProcessMessageDirectoryPath:
+    """目录型路径（尾部 /）按毒消息处理（2026-06-10 决策）：copy/delete 都不执行，
+    ERROR 日志输出消息详情，快速重投 3 次进 DLQ，继续消费新消息。"""
+
+    DIR_BODY = json.dumps({
+        "source": "gcs:eu-abc-dw/libs/hive/warehouse/aml.db/aml_item_fea_mid_dev_all/dt=20250724/days=30/",
+        "destination": "s3:s3euprodabcdw/libs/hive/warehouse/aml.db/aml_item_fea_mid_dev_all/dt=20250724/days=30/",
+    })
+
+    def _process_body(self, body, spy):
+        ran = {"called": False}
+
+        def fake_run(*a, **k):
+            ran["called"] = True
+            return _fake_run_result(State.SUCCESS)
+
+        out = process_message(
+            body=body,
+            object_size=1024,
+            instance_id="i-test",
+            config_path="/tmp/c",
+            region="r",
+            status_table="t",
+            now_iso="2026-06-10T00:00:00",
+            run_fn=fake_run,
+            delete_fn=spy.delete,
+            record_fn=spy.record,
+            report_fn=spy.report,
+            requeue_fn=spy.requeue,
+        )
+        return out, ran
+
+    def test_copy_directory_source_is_poison(self, caplog):
+        import logging as _logging
+        spy = _Spy()
+        with caplog.at_level(_logging.ERROR, logger="migration.worker"):
+            out, ran = self._process_body(self.DIR_BODY, spy)
+        assert out.state is State.FATAL
+        assert out.counted is False
+        assert ran["called"] is False          # 绝不执行 rclone（防整树复制副作用）
+        assert spy.deleted is False            # 不删 → 烧向 DLQ 留底
+        assert spy.requeues == [0]             # 立即重投
+        # ERROR 日志必须输出消息详情（不是只有 hash 摘要）
+        assert "days=30/" in caplog.text
+        assert "directory_path" in caplog.text
+        # DDB key 用真实 source（可按源路径搜索），不是 poison:<hash>
+        assert spy.recorded["source"] == (
+            "gcs:eu-abc-dw/libs/hive/warehouse/aml.db/aml_item_fea_mid_dev_all/"
+            "dt=20250724/days=30/"
+        )
+        assert spy.recorded["message_body"] == self.DIR_BODY
+
+    def test_delete_directory_destination_is_poison(self):
+        spy = _Spy()
+        body = json.dumps({
+            "op": "delete",
+            "destination": "s3:s3euprodabcdw/libs/hive/warehouse/aml.db/x/dt=20250724/",
+        })
+        out, ran = self._process_body(body, spy)
+        assert out.state is State.FATAL
+        assert ran["called"] is False
+        assert spy.deleted is False
+        assert spy.requeues == [0]
+        # delete 消息无 source → 退回 destination 作可搜索 key
+        assert spy.recorded["source"] == (
+            "s3:s3euprodabcdw/libs/hive/warehouse/aml.db/x/dt=20250724/"
+        )
+
+    def test_unparseable_json_falls_back_to_hash_key(self):
+        # 烂 JSON 提不出 source → 退回 poison:<md5> 摘要 key（仍可追溯）
+        spy = _Spy()
+        out, _ = self._process_body("{bad json", spy)
+        assert out.state is State.FATAL
+        assert spy.recorded["source"].startswith("poison:")
+
+    def test_normal_object_path_still_processed(self):
+        spy = _Spy()
+        body = json.dumps({
+            "source": "gcs:eu-abc-dw/libs/hive/warehouse/dw.db/x/part-00275.orc",
+            "destination": "s3:s3euprodabcdw/libs/hive/warehouse/dw.db/x/part-00275.orc",
+        })
+        out, ran = self._process_body(body, spy)
+        assert out.state is State.SUCCESS
+        assert ran["called"] is True           # 正常对象不受影响
 
 
 class TestResolveInstanceId:

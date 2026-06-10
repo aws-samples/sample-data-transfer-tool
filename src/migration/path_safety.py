@@ -4,11 +4,15 @@
 ``rclone_runner`` 兜底（argv 数组传参、非 ``shell=True``、``--`` terminator、flag
 白名单），且能进 SQS 的消息本就过了 SQS XML 校验，字符层面天然安全。
 
-保留两项：
+保留三项：
 - ``empty``：无对象 key（``remote:bucket`` 无 ``/key``）= 无效消息。
 - ``too_long``：对象 key 超过 GCS/S3 的 1024 字节上限 → rclone 必失败（实测 S3
   HeadObject 400 / create-fs critical）。提前拦成 poison，避免它落 UNKNOWN 卡满
   in-flight、12h×3 才进 DLQ。这是**运维考量**（防卡），不是安全考量。
+- ``directory_path``：尾部 ``/`` = 目录/前缀，不是单对象（2026-06-10 决策）。
+  copyto 对目录源会**整树递归复制**（实测一条消息复制出 220 个对象，爆炸半径
+  失控）、deletefile 对目录必失败。本工具契约是"一条消息 = 一个对象"，目录型
+  消息按 poison 拦截（ERROR 日志 + 快速重投 3 次进 DLQ），不执行任何 rclone。
 
 特殊 key（中文/emoji/``//``/前导斜杠/尾随空格）一律放行：worker 经 S3-compatible
 （HMAC）端点访问 GCS，XML API 保留字面 key 可正常传输（已实测 rc=0）。
@@ -22,10 +26,13 @@ def validate_object_path(name: str, max_bytes: int = _DEFAULT_MAX_BYTES) -> tupl
     """Validate a single object key can physically traverse the pipeline.
 
     Returns ``(is_safe, reason)``. ``reason == "ok"`` when safe.
-    只拦 ``empty`` 与 ``too_long``（见模块 docstring）。
+    只拦 ``empty`` / ``too_long`` / ``directory_path``（见模块 docstring）。
     """
     if not name:
         return False, "empty"
+
+    if name.endswith("/"):
+        return False, "directory_path"
 
     encoded = name.encode("utf-8")
     if len(encoded) > max_bytes:

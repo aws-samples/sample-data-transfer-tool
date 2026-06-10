@@ -52,8 +52,11 @@ _ERROR_PATTERNS: list[tuple[re.Pattern[str], str | None]] = [
     (re.compile(r"hash (?:mismatch|differ)|corrupted on transfer", re.IGNORECASE), "integrity_hash"),
     # src_acl_deny：403 / permissionDenied
     (re.compile(r"\b403\b|permissiondenied|forbidden", re.IGNORECASE), "src_acl_deny"),
-    # src_not_found：404 / notFound
-    (re.compile(r"\b404\b|notfound|does not exist", re.IGNORECASE), "src_not_found"),
+    # src_not_found：404 / notFound / doesn't exist（rclone copyto 源缺失 critical 消息）
+    (
+        re.compile(r"\b404\b|notfound|does not exist|doesn'?t exist", re.IGNORECASE),
+        "src_not_found",
+    ),
     # src_rate_limit：429
     (re.compile(r"\b429\b|too many requests|ratelimit", re.IGNORECASE), "src_rate_limit"),
     # 5xx：再按源/目标分流（resolver 用 None 占位，下面单独处理）
@@ -81,6 +84,25 @@ _TRANSIENT_ERROR = re.compile(
 )
 
 
+# 源对象不存在：rclone copyto 源缺失时走 cmd/cmd.go 的 generic critical 路径，
+# 以退出码 1 退出（不是 3/4），消息为 "Source doesn't exist or is a directory and
+# destination is a file"。1 不在 _STATE_BY_EXIT_CODE → UNKNOWN → 不删不计数、
+# 空占 12h visibility × maxReceiveCount 次（36h）才进 DLQ。但源不存在是确定性
+# 终态（上游清单超前于实际数据等），重试永远不会成功，应升级 FATAL（删消息 +
+# 计数 + DDB 记 src_not_found）。要求 "source" 紧邻 "doesn't exist"，避免误伤
+# 其它 not-found 文案（如退出码 3/4 的 directory not found 已有自己的 FATAL 路径）。
+_SOURCE_MISSING = re.compile(r"source\s+(?:doesn'?t|does\s+not)\s+exist", re.IGNORECASE)
+
+
+def is_source_missing(stderr: str) -> bool:
+    """stderr 是否表示"源对象不存在"（确定性终态，重试无用）。
+
+    供 runner 判定：rclone 退出码 1（通用错误）+ stderr 命中源缺失时，
+    把本应归 UNKNOWN 的结果升级为 FATAL（删消息 + 计数，不再空转重投）。
+    """
+    return bool(_SOURCE_MISSING.search(stderr or ""))
+
+
 def is_delete_noop(stderr: str) -> bool:
     """delete 操作的 stderr 是否表示"目标已不存在"（幂等成功，非真失败）。
 
@@ -96,6 +118,28 @@ def is_transient_error(stderr: str) -> bool:
     把本应归 UNKNOWN 的结果升级为 RETRYABLE（限流类错误重试可成功，应计数）。
     """
     return bool(_TRANSIENT_ERROR.search(stderr or ""))
+
+
+# 失败快速重投（2026-06-10 决策）：所有失败态不再等 12h visibility 自然过期，
+# 处理完立即 change_message_visibility 丢回队列，ReceiveCount 照常累积、
+# maxReceiveCount=3 后进 DLQ 留底（可 replay）。延迟按 error_class 分级：
+# - 限流类必须给源端恢复窗口——0 秒连打 3 次必然 3 连败，会把"等几分钟就能
+#   成功"的消息假性打进 DLQ；
+# - 5xx 给短退避（后端抖动通常秒级恢复）；
+# - 确定性终态（not_found/acl/arg/poison）与崩溃类重试本就无望或需人工介入，
+#   0 秒立即重投快速烧满 3 次进 DLQ，不浪费 in-flight 槽位。
+_RETRY_DELAY_BY_ERROR_CLASS: dict[str, int] = {
+    "src_rate_limit": 300,
+    "src_5xx": 60,
+    "dst_5xx": 60,
+}
+
+
+def retry_delay_seconds(error_class: str | None) -> int:
+    """失败快速重投的 VisibilityTimeout 秒数（按 error_class 分级退避）。"""
+    if error_class is None:
+        return 0
+    return _RETRY_DELAY_BY_ERROR_CLASS.get(error_class, 0)
 
 
 def classify_state(exit_code: int) -> State:

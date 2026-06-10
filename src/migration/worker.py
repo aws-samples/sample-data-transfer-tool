@@ -49,6 +49,21 @@ def _object_key(remote_path: str) -> str:
     return path.split("/", 1)[1] if "/" in path else ""
 
 
+def _poison_key(body: str) -> str:
+    """毒消息的 DDB 可追溯 key：尽量提取真实 source/destination（按源路径可搜），
+    JSON 烂到提不出时退回 'poison:<md5(body)>' 摘要。"""
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            for field in ("source", "destination"):
+                value = data.get(field)
+                if isinstance(value, str) and value:
+                    return value
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return f"poison:{hashlib.md5(body.encode('utf-8', 'replace')).hexdigest()}"  # noqa: S324
+
+
 def parse_message_body(body: str) -> TransferMessage:
     """解析并校验 SQS 消息体。
 
@@ -71,8 +86,16 @@ def parse_message_body(body: str) -> TransferMessage:
     # copy 需 source+destination；delete 只删目标端，仅需 destination（source 可空）。
     required = ("destination",) if op == "delete" else ("source", "destination")
     for field in required:
-        if field not in data:
-            raise ValueError(f"missing required field: {field}")
+        # 类型混淆防御：缺失/非字符串/空值统一 ValueError → poison 链路（DDB 留终态）。
+        # 否则 int/None/list 在下游抛 TypeError，逃逸到 swallowed 计数、查无此案。
+        if not isinstance(data.get(field), str) or not data[field]:
+            raise ValueError(f"missing or non-string field: {field}")
+
+    rclone_args = data.get("rclone_args", [])
+    if rclone_args is not None and not isinstance(rclone_args, list):
+        raise ValueError("rclone_args must be a list")
+    if isinstance(rclone_args, list) and any(not isinstance(a, str) for a in rclone_args):
+        raise ValueError("rclone_args elements must be strings")
 
     # 只校验实际存在的端点路径（delete 无 source 时不校验 source）。
     for field in ("source", "destination"):
@@ -121,18 +144,21 @@ def process_message(
     delete_fn: Callable[[], None],
     record_fn: Callable[..., None],
     report_fn: Callable[..., None],
+    requeue_fn: Callable[[int], None],
 ) -> ProcessOutcome:
     """处理单条消息，返回四态结果。所有副作用经注入函数，便于测试。
 
-    四态语义（spec §4.1）：
+    四态语义（spec §4.1，2026-06-10 改为失败快速重投）：
       SUCCESS   → 删消息 + 记终态 + 上报 + 计数
-      RETRYABLE → 不删（靠 visibility timeout 重投）+ 记 FAILED + 上报 + 计数
-      FATAL     → 不删（记 FAILED + 上报 + 计数）；靠自然重投 3 次后 SQS 转 DLQ
-      UNKNOWN   → 不删 + 不计数（崩溃/SIGKILL/未预期）
+      RETRYABLE → 不删 + requeue_fn(分级退避秒数) 快速重投 + 记 FAILED + 计数
+      FATAL     → 不删 + requeue_fn(0) 立即重投 + 记 FAILED + 计数
+      UNKNOWN   → 不删 + requeue_fn(0) 立即重投 + 不计数（崩溃/未预期）
 
-    删除原则：**只有 SUCCESS 删消息**。其余处理不了的（RETRYABLE/FATAL/poison/
-    UNKNOWN）一律保留，靠 12h visibility 自然超时重投，maxReceiveCount=3 后由 SQS
-    转入 DLQ —— 绝不直接删除，保证"处理不了的消息最终都在 DLQ 留底、可 replay"。
+    删除原则：**只有 SUCCESS 删消息**。其余一律保留并经 requeue_fn 立即改
+    VisibilityTimeout 丢回队列（不再等 12h 自然过期），每次重投 ReceiveCount+1，
+    maxReceiveCount=3 后由 SQS 转入 DLQ —— 绝不直接删除，保证"处理不了的消息
+    最终都在 DLQ 留底、可 replay"。退避秒数按 error_class 分级
+    （error_classifier.retry_delay_seconds）：限流 300s、5xx 60s、其余 0s。
     """
     queue_type = "large" if is_large_object(object_size) else "small"
 
@@ -143,8 +169,16 @@ def process_message(
     try:
         msg = parse_message_body(body)
     except ValueError as exc:
-        poison_source = f"poison:{hashlib.md5(body.encode('utf-8', 'replace')).hexdigest()}"  # noqa: S324
-        logger.error("poison message: %s (source=%s) -> 留队列待 DLQ", exc, poison_source)
+        # DDB key 优先用消息里的真实 source/destination（按源路径可直接搜索——
+        # 目录路径/缺字段这类 poison 的 JSON 本身合法）；烂 JSON 提不出时才退回
+        # poison:<md5(body)> 摘要 key。
+        poison_source = _poison_key(body)
+        # 消息详情进 ERROR 日志（→ worker-ops/CloudWatch），便于不登机定位是哪条
+        # 消息坏了（目录路径/缺字段/烂 JSON）。截断 2KB 防超长 body 刷爆单条日志。
+        logger.error(
+            "poison message: %s (source=%s) -> 快速重投 3 次后进 DLQ\nbody: %s",
+            exc, poison_source, body[:2048],
+        )
         poison_result = RunResult(
             state=State.FATAL,
             exit_code=-1,
@@ -157,9 +191,11 @@ def process_message(
                 attempt_timestamp=now_iso,
                 result=poison_result,
                 instance_id=instance_id,
+                message_body=body,  # 完整消息体进 DDB（定位/replay 不再只有 hash）
             )
         except Exception:  # noqa: BLE001 - 记录失败不影响"不删、走 DLQ"
             logger.exception("failed to record poison terminal")
+        requeue_fn(0)  # poison 立即重投，快速烧满 3 次进 DLQ
         return ProcessOutcome(state=State.FATAL, counted=False)
 
     result = run_fn(msg, config_path, is_large_object(object_size))
@@ -176,11 +212,13 @@ def process_message(
         )
 
     # 终态记录（UNKNOWN 也记，便于排查；但不计数、不删消息）。
+    # 出错消息附完整原始消息体（2026-06-10 决策）；SUCCESS 不存（百万级行省容量）。
     record_fn(
         source=msg.source,
         attempt_timestamp=now_iso,
         result=result,
         instance_id=instance_id,
+        message_body=None if result.state is State.SUCCESS else body,
     )
 
     # 监控上报（event 含 source 进明细层；EMF 维度只用低基数字段）。
@@ -208,12 +246,17 @@ def process_message(
     if result.state is State.SUCCESS:
         delete_fn()
         return ProcessOutcome(state=State.SUCCESS, counted=True)
+
+    # 全部失败态：不删 + 立即改 visibility 快速重投（按 error_class 分级退避），
+    # ReceiveCount 照常累积，maxReceiveCount=3 后 SQS 转 DLQ 留底。
+    from . import error_classifier
+    requeue_fn(error_classifier.retry_delay_seconds(result.error_class))
+
     if result.state is State.FATAL:
-        # 不删：靠自然重投 3 次后 SQS 转 DLQ（处理不了的消息留底、可 replay，不直接丢）。
         return ProcessOutcome(state=State.FATAL, counted=True)
     if result.state is State.RETRYABLE:
-        return ProcessOutcome(state=State.RETRYABLE, counted=True)  # 不删，自然重投
-    # UNKNOWN：不删、不计数。
+        return ProcessOutcome(state=State.RETRYABLE, counted=True)
+    # UNKNOWN：不计数。
     return ProcessOutcome(state=State.UNKNOWN, counted=False)
 
 
@@ -245,6 +288,8 @@ class WorkerLoop:
             "unknown": 0,
             "delete_ok": 0,
             "delete_fail": 0,
+            "requeue_ok": 0,
+            "requeue_fail": 0,
             "swallowed": 0,
             "total": 0,
         }
@@ -267,7 +312,7 @@ class WorkerLoop:
         self._tpslimit = "off"
         self._bwlimit_lock = threading.Lock()
 
-    def _record(self, *, source, attempt_timestamp, result, instance_id):
+    def _record(self, *, source, attempt_timestamp, result, instance_id, message_body=None):
         client = status_store_client(self.settings.aws_region)
         status_store.record_terminal(
             client,
@@ -277,6 +322,7 @@ class WorkerLoop:
             result,
             instance_id,
             now_iso=attempt_timestamp,
+            message_body=message_body,
         )
 
     def _report(self, event):
@@ -314,6 +360,7 @@ class WorkerLoop:
                 delete_fn=lambda: self._delete_message(receipt),
                 record_fn=self._record,
                 report_fn=self._report,
+                requeue_fn=lambda delay: self._requeue_message(receipt, delay),
             )
             self._tally(outcome)
         finally:
@@ -337,6 +384,30 @@ class WorkerLoop:
             raise
         with self._lock:
             self.stats["delete_ok"] += 1
+
+    def _requeue_message(self, receipt: str, delay: int) -> None:
+        """失败快速重投：把消息 VisibilityTimeout 改为 delay 秒，立即/短退避后重投。
+
+        rclone 已退出才会走到这里，不存在双写窗口（timeout<visibility 防的是
+        "传输中被重投"）。失败不抛出——visibility 改不动（节流/receipt 过期）时
+        消息退化为 12h 自然过期重投（原行为），单独计数便于观测。
+        """
+        try:
+            self.sqs.change_message_visibility(
+                QueueUrl=self.queue_url,
+                ReceiptHandle=receipt,
+                VisibilityTimeout=delay,
+            )
+        except Exception:  # noqa: BLE001 - 退化为自然重投，不影响主流程
+            with self._lock:
+                self.stats["requeue_fail"] += 1
+            logger.warning(
+                "requeue 失败（消息退化为 12h visibility 自然重投）delay=%s", delay,
+                exc_info=True,
+            )
+            return
+        with self._lock:
+            self.stats["requeue_ok"] += 1
 
     def _tally(self, outcome: ProcessOutcome) -> None:
         with self._lock:

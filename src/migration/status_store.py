@@ -68,6 +68,12 @@ def create_tables(client, status_table: str, heartbeat_table: str) -> None:
     )
 
 
+# message_body 截断上限：SQS body 可达 256KB，DDB 单 item 上限 400KB（与
+# error_message/rclone_command 同行），截断防 ValidationException 整行写失败。
+# 16KB 足够覆盖正常消息（source+destination+rclone_args 通常 <1KB）。
+_MAX_MESSAGE_BODY_BYTES = 16 * 1024
+
+
 def record_terminal(
     client,
     table: str,
@@ -77,11 +83,14 @@ def record_terminal(
     instance_id: str,
     *,
     now_iso: str,
+    message_body: str | None = None,
 ) -> None:
     """写一条终态记录。
 
     每次 attempt 用各自的 attempt_timestamp 作 SK，故为独立行（不覆盖历史尝试）。
     now_iso 作参数注入（不在函数内调 datetime.now，便于测试且适配受限环境）。
+    message_body：原始 SQS 消息体（2026-06-10 决策：出错消息 DDB 记录完整消息体，
+    便于直接定位/replay）。SUCCESS 路径不传（百万级成功行不重复存 body）。
     """
     item: dict = {
         "source_hash": {"S": make_pk(source)},
@@ -99,6 +108,8 @@ def record_terminal(
         item["error_class"] = {"S": result.error_class}
     if result.error_message is not None:
         item["error_message"] = {"S": result.error_message}
+    if message_body is not None:
+        item["message_body"] = {"S": message_body[:_MAX_MESSAGE_BODY_BYTES]}
 
     client.put_item(TableName=table, Item=item)
 
