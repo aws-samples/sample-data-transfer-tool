@@ -173,8 +173,58 @@ def test_threads_move_concurrently_without_loss():
     assert len(deleted) == 100 and len(set(deleted)) == 100
 
 
+# ───────────────────────────── 进度回调 ────────────────────────────────────
+def test_progress_callback_fires_per_threshold():
+    """每搬运满 progress_every 条触发一次 on_progress(moved 累计值)。"""
+    batches = [[_msg(f"r{b}-{i}", f"s3:a/{b}/{i}") for i in range(10)] for b in range(5)]
+    sqs = FakeSQS(batches)
+    seen = []
+    queue_mover.move_messages(
+        sqs, src_url=SRC, dst_url=DST, max_messages=50,
+        progress_every=20, on_progress=lambda moved: seen.append(moved),
+    )
+    # 50 条、每 20 触发 → 至少在 20、40 跨越点各报一次，且末尾收尾报一次
+    assert seen, "进度回调从未触发"
+    assert seen[-1] == 50  # 收尾必报最终值
+    assert any(v >= 20 for v in seen)
+
+
+def test_progress_disabled_when_every_zero():
+    sqs = FakeSQS([[_msg("r1", "s3:a/1")]])
+    seen = []
+    queue_mover.move_messages(
+        sqs, src_url=SRC, dst_url=DST, max_messages=10,
+        progress_every=0, on_progress=lambda moved: seen.append(moved),
+    )
+    assert seen == []  # progress_every=0 关闭进度
+
+
 # ───────────────────────────── CLI 入口 ────────────────────────────────────
 def test_main_requires_different_queues(capsys):
     rc = queue_mover.main(["--src-queue", SRC, "--dst-queue", SRC])
     assert rc == 2
     assert "不能相同" in capsys.readouterr().err
+
+
+def test_main_log_file_written(tmp_path, monkeypatch):
+    """--log-file 把搬运日志落到本地盘（控制台同时有）。"""
+    log_path = tmp_path / "mover.log"
+    fake = FakeSQS([[_msg("r1", "s3:a/1"), _msg("r2", "s3:a/2")]])
+    monkeypatch.setattr(queue_mover, "_build_sqs_client", lambda region, threads: fake)
+    rc = queue_mover.main([
+        "--src-queue", SRC, "--dst-queue", DST,
+        "--region", "eu-south-2", "--max", "2",
+        "--log-file", str(log_path),
+    ])
+    assert rc == 0
+    assert log_path.exists()
+    content = log_path.read_text()
+    assert "已搬运" in content or "搬运" in content
+
+
+def test_main_rejects_bad_procs(capsys):
+    rc = queue_mover.main([
+        "--src-queue", SRC, "--dst-queue", DST,
+        "--region", "eu-south-2", "--procs", "0",
+    ])
+    assert rc == 2
