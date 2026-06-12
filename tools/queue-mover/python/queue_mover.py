@@ -12,7 +12,7 @@
   - MessageAttributes 透传（object_size 等路由属性），过滤 AWS. 保留前缀。
 
 用法：
-  python3 -m migration.queue_mover \\
+  python3 queue_mover.py \\
       --src-queue https://sqs.<region>.amazonaws.com/<acct>/migration-a-queue \\
       --dst-queue https://sqs.<region>.amazonaws.com/<acct>/migration-b-queue \\
       [--max 100000] [--threads 8] [--region eu-south-2] [--dry-run]
@@ -159,9 +159,17 @@ def move_messages(
 
 def _build_sqs_client(region: str, threads: int):
     """构建 SQS client（连接池按线程数适配 + adaptive retry）。抽出便于测试注入。"""
-    from .aws_clients import get_sqs_client
+    import boto3
+    from botocore.config import Config
 
-    return get_sqs_client(region)
+    return boto3.client(
+        "sqs",
+        region_name=region,
+        config=Config(
+            retries={"max_attempts": 10, "mode": "adaptive"},
+            max_pool_connections=max(10, threads + 4),
+        ),
+    )
 
 
 def _setup_logging(log_file: str | None) -> None:
