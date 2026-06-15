@@ -46,3 +46,11 @@ CLAUDE.md
 docs/
 deploy-params-*.json
 !deploy-params-*.json.template
+
+# Go 编译产物（源码可随时重编，二进制不入库）。
+# 精确指向 go/ 子目录下与模块同名的可执行文件，不用 ** 以免误伤同名目录/源码。
+tools/dlq-cleaner/go/dlq-cleaner
+tools/queue-mover/go/queue-mover
+# 跨平台交叉编译产物
+tools/**/*-linux-amd64
+tools/**/*-linux-arm64

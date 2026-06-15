@@ -9,7 +9,7 @@
 import json
 import threading
 
-from migration import queue_mover
+import queue_mover
 
 
 class FakeSQS:
