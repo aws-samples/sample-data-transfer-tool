@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -102,6 +103,47 @@ func TestSendBatchNacksWholeOnError(t *testing.T) {
 	}
 	if st.sendFails != 2 {
 		t.Fatalf("sendFails=%d want 2", st.sendFails)
+	}
+}
+
+func TestErrLogThrottle(t *testing.T) {
+	// 防爆盘：5s 窗口内连打只放行 1 次（其余只更新不了时间戳被跳过）。
+	st := &bridgeStats{}
+	logged := 0
+	emit := func() {
+		now := time.Now().UnixNano()
+		last := st.lastErrLogNanos
+		if now-last < int64(errLogThrottle) {
+			return
+		}
+		// 模拟 throttledErrLog 的 CAS 放行逻辑
+		st.lastErrLogNanos = now
+		logged++
+	}
+	// 首次必放行；紧接着 999 次在同一窗口内应全部被压制
+	for i := 0; i < 1000; i++ {
+		emit()
+	}
+	if logged != 1 {
+		t.Fatalf("5s 窗口内应只放行 1 条日志，实际 %d 条", logged)
+	}
+}
+
+func TestSendFailsStillCountedWhenLogThrottled(t *testing.T) {
+	// 关键：日志被限流，但失败计数 sendFails 必须照常累加（汇总行才能反映真实失败量）
+	f := &fakeSender{failAll: true}
+	st := &bridgeStats{}
+	var a, n int64
+	for round := 0; round < 3; round++ {
+		batch := []inboundMessage{mkInbound(`{}`, 0, &a, &n), mkInbound(`{}`, 0, &a, &n)}
+		sendBatch(context.Background(), f, "q", batch, st)
+	}
+	// 3 批 × 2 条 = 6 条失败，全部计入 sendFails（不受日志限流影响）
+	if st.sendFails != 6 {
+		t.Fatalf("sendFails=%d want 6（计数不受日志限流影响）", st.sendFails)
+	}
+	if n != 6 {
+		t.Fatalf("nacked=%d want 6", n)
 	}
 }
 

@@ -39,7 +39,13 @@ type bridgeStats struct {
 	sent      int64 // 成功投递 SQS
 	mapErrors int64 // 映射失败（payload 坏等）
 	sendFails int64 // SQS send 失败（nack 让 Pub/Sub 重投）
+	// 失败日志限流：上次打 SQS 错误日志的 unix 纳秒时间戳（原子）。
+	// 防止 SQS 故障风暴下 per-batch 日志刷爆磁盘——失败总量看 30s 进度行的 sendFails。
+	lastErrLogNanos int64
 }
+
+// 失败日志最小间隔：SQS 持续故障时，最多每隔这么久打一条错误日志（其余只累加计数）。
+const errLogThrottle = 5 * time.Second
 
 // batchSender 从 channel 收映射好的消息，攒批 10 条投 SQS，整批成功后逐条 ack。
 // 多个 send worker 并发跑本函数，提升投递吞吐（send_workers 默认 64）。
@@ -104,17 +110,18 @@ func sendBatch(ctx context.Context, sender sqsSender, queueURL string, batch []i
 	if err != nil {
 		// 整批失败：全部 nack，Pub/Sub 稍后重投（不丢，at-least-once）。
 		atomic.AddInt64(&st.sendFails, int64(len(batch)))
-		log.Printf("SQS send 整批失败（%d 条 nack 重投）: %v", len(batch), err)
+		// 限流打日志：SQS 故障风暴下不刷爆磁盘；失败总量看 30s 进度行的 sendFails。
+		throttledErrLog(st, "SQS send 整批失败（%d 条 nack 重投，最近一次错误）: %v", len(batch), err)
 		for _, m := range batch {
 			m.nackFn()
 		}
 		return
 	}
 	// 成功的 ack，失败的 nack（Id 是 batch 下标）。
+	// 单条失败不再 per-message 打日志（高频会爆盘）——只累加 sendFails，由进度行汇总。
 	failed := map[string]bool{}
 	for _, f := range out.Failed {
 		failed[aws.ToString(f.Id)] = true
-		log.Printf("SQS send 单条失败 id=%s code=%s", aws.ToString(f.Id), aws.ToString(f.Code))
 	}
 	for i, m := range batch {
 		if failed[strconv.Itoa(i)] {
@@ -125,4 +132,19 @@ func sendBatch(ctx context.Context, sender sqsSender, queueURL string, batch []i
 			m.ackFn() // 先发后 ack：投 SQS 成功才 ack Pub/Sub
 		}
 	}
+}
+
+// throttledErrLog 限流打错误日志：距上次同类日志不足 errLogThrottle 则只累计不打，
+// 防止 SQS 持续故障时 per-batch 日志（高吞吐下每秒数千条）刷爆磁盘。
+// 用原子 CAS 抢占时间窗，多 send worker 并发安全。失败总量仍由 30s 进度行的 sendFails 反映。
+func throttledErrLog(st *bridgeStats, format string, args ...any) {
+	now := time.Now().UnixNano()
+	last := atomic.LoadInt64(&st.lastErrLogNanos)
+	if now-last < int64(errLogThrottle) {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&st.lastErrLogNanos, last, now) {
+		return // 另一个 worker 刚打过，本次跳过
+	}
+	log.Printf(format, args...)
 }
