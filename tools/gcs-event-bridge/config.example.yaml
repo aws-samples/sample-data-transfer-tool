@@ -1,0 +1,43 @@
+# gcs-event-bridge 配置示例
+#
+# 部署前置（GCP 侧，每个源桶各做一次）：
+#   1. 建 Pub/Sub topic
+#   2. 在 GCS 桶上配 notification，payloadFormat 必须 = JSON_API_V1（否则拿不到 size），
+#      event_types 只留 OBJECT_FINALIZE、OBJECT_METADATA_UPDATE：
+#        gcloud storage buckets notifications create gs://<bucket> \
+#          --topic=<topic> --payload-format=json \
+#          --event-types=OBJECT_FINALIZE,OBJECT_METADATA_UPDATE
+#   3. 建 pull 订阅，授 SA roles/pubsub.subscriber
+#   4. SA JSON key 存进 AWS Secrets Manager（SecretString），记下 ARN
+#
+# AWS 侧：运行实例的 role 需 secretsmanager:GetSecretValue（对应 ARN）+ sqs:SendMessage（目标队列）
+
+region: eu-south-2
+
+pipelines:
+  # 单源示例
+  - name: eu-abc-dw
+    source:
+      subscription: projects/my-gcp-project/subscriptions/eu-abc-dw-sub
+      sa_secret_arn: arn:aws:secretsmanager:eu-south-2:123456789012:secret:gcp-sa-dw-AbCdEf
+      # project_id: my-gcp-project   # 可选，缺省从 subscription 名解析
+    dest:
+      queue_url: https://sqs.eu-south-2.amazonaws.com/123456789012/gcs-2-s3-worker-m6in-pool1-queue
+      dest_bucket: s3euprodabcdw        # 目标 S3 桶（映射 destination 用）
+      dest_prefix: ""                    # 可选目标前缀，留空则 destination = s3:<bucket>/<gcs-key>
+    # tuning 全部可选，缺省：num_goroutines=32 / max_outstanding_messages=50000 / send_workers=64
+    # tuning:
+    #   num_goroutines: 32
+    #   max_outstanding_messages: 50000
+    #   send_workers: 64
+
+  # 多源示例：再加一条，可指向不同 GCP project / 不同 SQS 队列，互相故障隔离
+  # - name: another-bucket
+  #   source:
+  #     subscription: projects/proj2/subscriptions/another-sub
+  #     sa_secret_arn: arn:aws:secretsmanager:eu-south-2:123456789012:secret:gcp-sa-2-XyZ
+  #   dest:
+  #     queue_url: https://sqs.eu-south-2.amazonaws.com/123456789012/another-cluster-queue
+  #     dest_bucket: another-s3-bucket
+  #   tuning:
+  #     send_workers: 128   # 高流量源单独调大
