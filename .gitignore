@@ -3,7 +3,13 @@ deploy-params-cfn-init.json
 deploy-params.json
 *-params.json
 
+# GCP service account keys (never commit)
+chrome-courage-*.json
+*-sa-key.json
+*-service-account*.json
+
 # Python
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class
