@@ -1,0 +1,9 @@
+# gcs-sqs-go 桶映射文件示例（由 BUCKET_MAP_FILE 指向）
+# 每行 3 列，逗号分隔：源GCS桶,目标S3桶,该桶inventory清单的s3://URI
+# # 注释行与空行忽略；inventory 必须以 s3:// 开头。
+# 校验规则：源桶不可重复（报错）；inventory URI 不可被多行复用（报错，否则会共用断点文件导致漏发）；
+# 同一目标 S3 桶可被多个源桶映射（允许“多源合并”，仅打印提示）。
+# 程序按此文件的行序逐桶处理，每个桶读取自己的 inventory。
+#
+# 源GCS桶,目标S3桶,inventory清单URI
+my-gcs-ailab,my-s3-ailab,s3://my-s3-bucket/ops/inventory/my-gcs-ailab/48449a57-6d8d-445c-832b-6530513491db_2026-06-12T00_00_manifest.formatted.json

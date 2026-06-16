@@ -1,0 +1,6 @@
+# copy_latest_inventory.py 桶白名单示例（复制为 bucket-list.txt 后填入真实桶名）
+# 每行一个 GCS 桶名（= inventory 根路径下的子目录名）；# 注释行与空行忽略；
+# 只处理列出的桶，不自动发现。重复桶名会告警并忽略。
+#
+# bucket-prod-a
+# bucket-prod-b

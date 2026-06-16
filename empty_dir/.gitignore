@@ -1,0 +1,9 @@
+# 数据 / 产物（不入库）
+*.parquet
+*.ckpt
+failed_keys.txt
+
+# 编译产物
+/go-create-markers/create-markers
+/go-create-markers/*.exe
+*.test

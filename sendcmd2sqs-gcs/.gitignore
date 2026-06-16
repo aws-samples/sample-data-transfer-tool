@@ -1,0 +1,22 @@
+# 编译产物
+/gcs-sqs-go
+/gcs-sqs-go-*
+/gcs-sqs-go.exe
+*.test
+
+# 凭证 / 部署配置（绝不提交；示例文件 config.env.example 保留）
+*.json
+!*.template.json
+config.env
+*.env
+!*.env.example
+
+# 断点/日志
+*.ckpt
+.gcs-sqs-ckpt-*.txt
+*.log
+*.log.gz
+/logs/
+
+# 真实桶映射 CSV（含真实桶名/inventory URI；只提交 .example 示例）
+bucket-map.csv
