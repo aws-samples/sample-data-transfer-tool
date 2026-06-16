@@ -34,11 +34,12 @@ type inboundMessage struct {
 
 // bridgeStats 单条 pipeline 的运行计数。
 type bridgeStats struct {
-	received  int64 // Pub/Sub 收到
-	skipped   int64 // 非关注事件跳过
-	sent      int64 // 成功投递 SQS
-	mapErrors int64 // 映射失败（payload 坏等）
-	sendFails int64 // SQS send 失败（nack 让 Pub/Sub 重投）
+	received   int64 // Pub/Sub 收到
+	skipped    int64 // 非关注事件跳过
+	sent       int64 // 成功投递 SQS
+	mapErrors  int64 // 映射失败（payload 坏等）
+	sendFails  int64 // SQS send 失败（nack 让 Pub/Sub 重投）
+	unknownBkt int64 // 源桶不在映射表 / 前缀无命中且无兜底（跳过 + 告警）
 	// 失败日志限流：上次打 SQS 错误日志的 unix 纳秒时间戳（原子）。
 	// 防止 SQS 故障风暴下 per-batch 日志刷爆磁盘——失败总量看 30s 进度行的 sendFails。
 	lastErrLogNanos int64

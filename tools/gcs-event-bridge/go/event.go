@@ -25,9 +25,11 @@ type migrationMessage struct {
 
 // mappedMessage 映射结果：SQS body + object_size 属性（仅 copy 有真实大小）。
 type mappedMessage struct {
-	Body       string
-	ObjectSize int64 // copy 来自 payload.size；delete 为 0
-	skip       bool  // 非 FINALIZE/DELETE 事件 → 跳过（直接 ack 丢弃）
+	Body        string
+	ObjectSize  int64  // copy 来自 payload.size
+	skip        bool   // 非关注事件 → 跳过（直接 ack 丢弃）
+	unknownBkt  bool   // 源桶不在映射表 / 前缀无兜底 → 跳过但单独计数告警
+	unknownInfo string // unknownBkt 时的说明（桶名/key），供日志
 }
 
 // gcsObjectMetadata 解析 payload（JSON_API_V1 object resource）需要的字段。
@@ -38,12 +40,13 @@ type gcsObjectMetadata struct {
 
 // mapEvent 把一条 Pub/Sub 消息（attributes + payload data）映射成迁移消息。
 //
-// 规则（owner 决策 2026-06-15）：
-//   - OBJECT_FINALIZE       → copy：对象创建/新版本，同步到 S3
-//   - OBJECT_METADATA_UPDATE → copy：元数据更新，重新同步该对象到 S3
-//     （两者映射等价：source=gcs:bucket/key, destination=s3:destBucket/prefix/key,
-//     object_size=payload.size）
-//   - 其余事件（DELETE/ARCHIVE/INITIALIZE…）→ skip（直接 ack 丢弃，不投 SQS）
+// 规则（owner 决策 2026-06-15/16）：
+//   - OBJECT_FINALIZE / OBJECT_METADATA_UPDATE → copy，其余事件 skip（ack 丢弃）。
+//   - 目标 S3 桶按 dest.BucketMapping[bucketId] 两级路由：
+//     · 写法 A（s3_bucket）：整桶映射 → s3:<s3_bucket>/<prefix>/<key>
+//     · 写法 B（prefix_routes）：按 key 最长前缀命中路由；不命中走 default_s3_bucket
+//   - 源桶不在映射表 / 前缀无命中且无兜底 → unknownBkt（跳过但单独计数告警，不投 SQS）。
+//   - 匹配后保留完整 key（不剥前缀），目标层级与源一致。
 //
 // 纯函数、无副作用、无 AWS/GCP 依赖，便于单测。
 func mapEvent(attrs map[string]string, payload []byte, dest Dest) (mappedMessage, error) {
@@ -56,13 +59,21 @@ func mapEvent(attrs map[string]string, payload []byte, dest Dest) (mappedMessage
 		if bucket == "" || objectKey == "" {
 			return mappedMessage{}, fmt.Errorf("%s 缺 bucketId/objectId", eventType)
 		}
+		s3Dest, destKey, ok := resolveDest(dest.BucketMapping, bucket, objectKey)
+		if !ok {
+			// 未知桶 / 前缀无命中且无兜底：跳过 + 计数告警（不投 SQS，也不报错 nack）。
+			return mappedMessage{
+				unknownBkt:  true,
+				unknownInfo: fmt.Sprintf("bucket=%s key=%s", bucket, objectKey),
+			}, nil
+		}
 		size, err := parseSize(payload)
 		if err != nil {
 			return mappedMessage{}, fmt.Errorf("解析 payload size: %w", err)
 		}
 		msg := migrationMessage{
 			Source:      fmt.Sprintf("gcs:%s/%s", bucket, objectKey),
-			Destination: destPath(dest, objectKey),
+			Destination: fmt.Sprintf("s3:%s/%s", s3Dest, destKey),
 		}
 		body, _ := json.Marshal(msg)
 		return mappedMessage{Body: string(body), ObjectSize: size}, nil
@@ -72,16 +83,44 @@ func mapEvent(attrs map[string]string, payload []byte, dest Dest) (mappedMessage
 	}
 }
 
-// destPath 拼目标 S3 路径：s3:<bucket>/<prefix>/<key>（prefix 可空；规整斜杠）。
-func destPath(dest Dest, objectKey string) string {
-	prefix := strings.Trim(dest.DestPrefix, "/")
-	var path string
-	if prefix == "" {
-		path = objectKey
-	} else {
-		path = prefix + "/" + objectKey
+// resolveDest 按桶映射规则解析目标"S3桶/可选前缀"段 + 目标对象 key。
+// 返回 (s3 桶段, 目标 key, 是否解析成功)，destination = s3:<桶段>/<目标key>。
+//   - 写法 A：整桶映射，可选 prefix 拼进桶段，目标 key = 原 key（保留完整层级）。
+//   - 写法 B 命中路由：默认目标 key = 原 key；该路由 StripPrefix=true 时剥掉匹配的前缀段。
+//   - 写法 B 不命中：走 default_s3_bucket（保留完整 key），无 default 则解析失败。
+func resolveDest(mapping map[string]BucketRule, gcsBucket, objectKey string) (string, string, bool) {
+	rule, ok := mapping[gcsBucket]
+	if !ok {
+		return "", "", false // 源桶未配映射
 	}
-	return fmt.Sprintf("s3:%s/%s", dest.DestBucket, path)
+	if rule.isPrefixRouted() {
+		// 写法 B：最长前缀优先。
+		bestLen := -1
+		var best PrefixRoute
+		for _, pr := range rule.PrefixRoutes {
+			if strings.HasPrefix(objectKey, pr.Prefix) && len(pr.Prefix) > bestLen {
+				bestLen = len(pr.Prefix)
+				best = pr
+			}
+		}
+		if bestLen >= 0 {
+			key := objectKey
+			if best.StripPrefix {
+				key = strings.TrimPrefix(objectKey, best.Prefix)
+			}
+			return best.S3Bucket, key, true
+		}
+		if rule.DefaultS3Bucket != "" {
+			return rule.DefaultS3Bucket, objectKey, true // 兜底保留完整 key
+		}
+		return "", "", false // 无命中且无兜底
+	}
+	// 写法 A：整桶映射，可选 prefix 拼进桶段，保留完整 key。
+	prefix := strings.Trim(rule.Prefix, "/")
+	if prefix == "" {
+		return rule.S3Bucket, objectKey, true
+	}
+	return rule.S3Bucket + "/" + prefix, objectKey, true
 }
 
 // parseSize 从 JSON_API_V1 payload 取 size（字符串字段转 int64）。空 payload 返回 0。

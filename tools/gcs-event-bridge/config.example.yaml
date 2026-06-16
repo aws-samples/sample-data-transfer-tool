@@ -1,43 +1,57 @@
-# gcs-event-bridge 配置示例
+# gcs-event-bridge 配置示例（脱敏；含客户真实资源的配置本地保留、不入库）
 #
 # 部署前置（GCP 侧，每个源桶各做一次）：
-#   1. 建 Pub/Sub topic
-#   2. 在 GCS 桶上配 notification，payloadFormat 必须 = JSON_API_V1（否则拿不到 size），
-#      event_types 只留 OBJECT_FINALIZE、OBJECT_METADATA_UPDATE：
+#   1. 建 Pub/Sub topic；多个源桶可共用一个 topic/订阅。
+#   2. GCS 桶配 notification，payload-format 必须 json（否则拿不到 object size），
+#      event-types 留 OBJECT_FINALIZE,OBJECT_METADATA_UPDATE：
 #        gcloud storage buckets notifications create gs://<bucket> \
 #          --topic=<topic> --payload-format=json \
 #          --event-types=OBJECT_FINALIZE,OBJECT_METADATA_UPDATE
-#   3. 建 pull 订阅，授 SA roles/pubsub.subscriber
-#   4. SA JSON key 存进 AWS Secrets Manager（SecretString），记下 ARN
+#   3. 建 pull 订阅，授 SA roles/pubsub.subscriber。
+#   4. SA JSON key 存进 AWS Secrets Manager，配置只放 ARN（不内联密钥）。
 #
-# AWS 侧：运行实例的 role 需 secretsmanager:GetSecretValue（对应 ARN）+ sqs:SendMessage（目标队列）
+# AWS 侧：运行实例 role 需 secretsmanager:GetSecretValue（对应 ARN）+ sqs:SendMessage（目标队列）。
 
 region: eu-south-2
 
 pipelines:
-  # 单源示例
-  - name: eu-abc-dw
+  - name: shared-incr
     source:
-      subscription: projects/my-gcp-project/subscriptions/eu-abc-dw-sub
-      sa_secret_arn: arn:aws:secretsmanager:eu-south-2:123456789012:secret:gcp-sa-dw-AbCdEf
-      # project_id: my-gcp-project   # 可选，缺省从 subscription 名解析
-    dest:
-      queue_url: https://sqs.eu-south-2.amazonaws.com/123456789012/gcs-2-s3-worker-m6in-pool1-queue
-      dest_bucket: s3euprodabcdw        # 目标 S3 桶（映射 destination 用）
-      dest_prefix: ""                    # 可选目标前缀，留空则 destination = s3:<bucket>/<gcs-key>
-    # tuning 全部可选，缺省：num_goroutines=32 / max_outstanding_messages=50000 / send_workers=64
-    # tuning:
-    #   num_goroutines: 32
-    #   max_outstanding_messages: 50000
-    #   send_workers: 64
+      # 多个源桶可共用同一个 Pub/Sub 订阅；程序按消息的 bucketId 查 bucket_mapping 分发。
+      subscription: projects/<GCP_PROJECT>/subscriptions/<SUB>
+      sa_secret_arn: arn:aws:secretsmanager:eu-south-2:<ACCOUNT>:secret:<SECRET_NAME>
+      # project_id: <GCP_PROJECT>   # 可选，缺省从 subscription 名解析
 
-  # 多源示例：再加一条，可指向不同 GCP project / 不同 SQS 队列，互相故障隔离
-  # - name: another-bucket
-  #   source:
-  #     subscription: projects/proj2/subscriptions/another-sub
-  #     sa_secret_arn: arn:aws:secretsmanager:eu-south-2:123456789012:secret:gcp-sa-2-XyZ
-  #   dest:
-  #     queue_url: https://sqs.eu-south-2.amazonaws.com/123456789012/another-cluster-queue
-  #     dest_bucket: another-s3-bucket
-  #   tuning:
-  #     send_workers: 128   # 高流量源单独调大
+    dest:
+      # 本 pipeline 所有源桶的消息都投这一个队列。
+      queue_url: https://sqs.eu-south-2.amazonaws.com/<ACCOUNT>/<STACK>-queue
+
+      # 源 GCS 桶 → 目标映射表。每个桶两种写法二选一：
+      bucket_mapping:
+
+        # 写法 A —— 整桶映射：该桶所有对象 → 一个 S3 桶，保留完整 key。
+        plain-gcs-bucket:
+          s3_bucket: target-s3-bucket
+
+        # 写法 A + 可选 prefix：目标 key 统一加前缀。
+        another-gcs-bucket:
+          s3_bucket: target-s3-bucket-2
+          prefix: migrated            # → s3:target-s3-bucket-2/migrated/<key>
+
+        # 写法 B —— 按对象 key 前缀路由到不同 S3 桶（最长前缀优先）：
+        special-gcs-bucket:
+          prefix_routes:
+            # strip_prefix=true：剥掉匹配的前缀段（如 hot/a/b → s3-hot/a/b）
+            - { prefix: "hot/",  s3_bucket: s3-hot,  strip_prefix: true }
+            - { prefix: "cold/", s3_bucket: s3-cold, strip_prefix: true }
+            # 不设 strip_prefix（默认 false）：保留完整 key（→ s3-logs/logs/...）
+            - { prefix: "logs/", s3_bucket: s3-logs }
+          default_s3_bucket: s3-misc  # 都不命中 → 兜底桶（保留完整 key）；不配则当未知桶跳过
+
+      # 注：完全没配进 bucket_mapping 的源桶 → 跳过 + 计数告警（进度行"未映射桶"），不投 SQS。
+
+    # tuning 全部可选，缺省：num_goroutines=32 / max_outstanding_messages=50000 / send_workers=64
+    tuning:
+      num_goroutines: 48              # 对齐核数（48 核机器）
+      max_outstanding_messages: 100000
+      send_workers: 128               # SQS 投递并发，吞吐主杠杆

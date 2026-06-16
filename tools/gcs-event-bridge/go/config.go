@@ -39,11 +39,39 @@ type Source struct {
 	ProjectID string `yaml:"project_id"`
 }
 
-// Dest AWS SQS 目的地 + 目标对象映射规则（1 源 → 1 队列固定）。
+// Dest AWS SQS 目的地 + GCS桶→S3桶 映射表（一条 pipeline 的所有源桶共用一个队列）。
 type Dest struct {
-	QueueURL   string `yaml:"queue_url"`
-	DestBucket string `yaml:"dest_bucket"` // 映射 destination 的目标 S3 桶
-	DestPrefix string `yaml:"dest_prefix"` // 可选目标前缀
+	QueueURL string `yaml:"queue_url"`
+	// 源 GCS 桶名 → 映射规则。多桶共用一个 Pub/Sub 订阅时，按消息的 bucketId 查表。
+	BucketMapping map[string]BucketRule `yaml:"bucket_mapping"`
+}
+
+// BucketRule 单个 GCS 桶的映射规则，两种写法二选一：
+//   - 写法 A（整桶映射）：填 s3_bucket（+ 可选 prefix）。
+//   - 写法 B（按 key 前缀路由）：填 prefix_routes（+ 可选 default_s3_bucket 兜底）。
+type BucketRule struct {
+	// 写法 A：整桶映射到这个 S3 桶。
+	S3Bucket string `yaml:"s3_bucket"`
+	// 写法 A 可选：统一加在目标 key 前的前缀。
+	Prefix string `yaml:"prefix"`
+	// 写法 B：按对象 key 的前缀头路由到不同 S3 桶（最长前缀优先）。
+	PrefixRoutes []PrefixRoute `yaml:"prefix_routes"`
+	// 写法 B 兜底：所有 prefix_routes 都不命中时用的 S3 桶（空=当未知桶跳过）。
+	DefaultS3Bucket string `yaml:"default_s3_bucket"`
+}
+
+// PrefixRoute 写法 B 的一条前缀路由：对象 key 以 Prefix 开头 → 投到 S3Bucket。
+// StripPrefix=true 时，目标 key 剥掉匹配的 Prefix 段（如 mallfile-gcp 的
+// gcsprodorms/a/b → s3euprodorms/a/b）；默认 false 保留完整 key（层级不变）。
+type PrefixRoute struct {
+	Prefix      string `yaml:"prefix"`
+	S3Bucket    string `yaml:"s3_bucket"`
+	StripPrefix bool   `yaml:"strip_prefix"`
+}
+
+// isPrefixRouted 该规则是否走"按 key 前缀路由"（写法 B）。
+func (r BucketRule) isPrefixRouted() bool {
+	return len(r.PrefixRoutes) > 0
 }
 
 // Tuning 每条 pipeline 独立调优（缺省走 default*）。
@@ -113,8 +141,37 @@ func (c *Config) validate() error {
 		if p.Dest.QueueURL == "" {
 			return fmt.Errorf("pipeline %q: dest.queue_url 必填", p.Name)
 		}
-		if p.Dest.DestBucket == "" {
-			return fmt.Errorf("pipeline %q: dest.dest_bucket 必填", p.Name)
+		if len(p.Dest.BucketMapping) == 0 {
+			return fmt.Errorf("pipeline %q: dest.bucket_mapping 至少配一个源桶", p.Name)
+		}
+		for gcsBucket, rule := range p.Dest.BucketMapping {
+			if err := validateRule(p.Name, gcsBucket, rule); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateRule 校验单条桶映射规则：写法 A 和 B 互斥、各自必填项齐全。
+func validateRule(pipeline, gcsBucket string, r BucketRule) error {
+	hasA := r.S3Bucket != ""
+	hasB := r.isPrefixRouted()
+	switch {
+	case hasA && hasB:
+		return fmt.Errorf("pipeline %q 桶 %q: s3_bucket 与 prefix_routes 不能同时配（写法 A/B 二选一）",
+			pipeline, gcsBucket)
+	case !hasA && !hasB:
+		return fmt.Errorf("pipeline %q 桶 %q: 必须配 s3_bucket（整桶映射）或 prefix_routes（前缀路由）之一",
+			pipeline, gcsBucket)
+	case hasB:
+		for i, pr := range r.PrefixRoutes {
+			if pr.Prefix == "" {
+				return fmt.Errorf("pipeline %q 桶 %q prefix_routes[%d]: prefix 必填", pipeline, gcsBucket, i)
+			}
+			if pr.S3Bucket == "" {
+				return fmt.Errorf("pipeline %q 桶 %q prefix_routes[%d]: s3_bucket 必填", pipeline, gcsBucket, i)
+			}
 		}
 	}
 	return nil

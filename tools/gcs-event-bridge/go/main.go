@@ -161,6 +161,14 @@ func handleMessage(m *pubsub.Message, dest Dest, st *bridgeStats, inCh chan<- in
 		m.Ack() // 非关注事件：直接 ack 丢弃，不占订阅
 		return
 	}
+	if mapped.unknownBkt {
+		// 源桶不在映射表（或前缀无命中且无兜底）：ack 丢弃 + 单独计数告警。
+		// 限流打日志，防未配桶大量事件刷爆磁盘；总量看进度行的 unknownBkt 计数。
+		atomicAdd(&st.unknownBkt)
+		throttledErrLog(st, "未映射的源桶事件已跳过（最近一次）: %s", mapped.unknownInfo)
+		m.Ack()
+		return
+	}
 	// 投递通道：ack 推迟到 batchSender 投 SQS 成功后调用（先发后 ack）。
 	inCh <- inboundMessage{mapped: mapped, ackFn: m.Ack, nackFn: m.Nack}
 }
@@ -198,9 +206,9 @@ func progressLoop(name string, st *bridgeStats, stop <-chan struct{}) {
 	for {
 		select {
 		case <-t.C:
-			log.Printf("pipeline %q 进度: 收 %d / 投 %d / 跳过 %d / 映射错 %d / 投递失败 %d",
+			log.Printf("pipeline %q 进度: 收 %d / 投 %d / 跳过 %d / 未映射桶 %d / 映射错 %d / 投递失败 %d",
 				name, ldAdd(&st.received, 0), ldAdd(&st.sent, 0), ldAdd(&st.skipped, 0),
-				ldAdd(&st.mapErrors, 0), ldAdd(&st.sendFails, 0))
+				ldAdd(&st.unknownBkt, 0), ldAdd(&st.mapErrors, 0), ldAdd(&st.sendFails, 0))
 		case <-stop:
 			return
 		}
@@ -208,9 +216,9 @@ func progressLoop(name string, st *bridgeStats, stop <-chan struct{}) {
 }
 
 func logFinal(name string, st *bridgeStats) {
-	log.Printf("pipeline %q 汇总: 收 %d / 投 %d / 跳过 %d / 映射错 %d / 投递失败 %d",
+	log.Printf("pipeline %q 汇总: 收 %d / 投 %d / 跳过 %d / 未映射桶 %d / 映射错 %d / 投递失败 %d",
 		name, ldAdd(&st.received, 0), ldAdd(&st.sent, 0), ldAdd(&st.skipped, 0),
-		ldAdd(&st.mapErrors, 0), ldAdd(&st.sendFails, 0))
+		ldAdd(&st.unknownBkt, 0), ldAdd(&st.mapErrors, 0), ldAdd(&st.sendFails, 0))
 }
 
 // dualWriter 日志同时写控制台和文件。

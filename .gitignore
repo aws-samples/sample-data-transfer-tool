@@ -55,3 +55,7 @@ tools/gcs-event-bridge/go/gcs-event-bridge
 # 跨平台交叉编译产物
 tools/**/*-linux-amd64
 tools/**/*-linux-arm64
+
+# gcs-event-bridge 真实配置（含客户桶名/订阅/ARN/队列）本地保留，只入库脱敏 example
+tools/gcs-event-bridge/config*.yaml
+!tools/gcs-event-bridge/config.example.yaml
