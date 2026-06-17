@@ -45,8 +45,11 @@ func Run(ctx context.Context, cfg Config) error {
 	go rl.Run(ctx, 60*time.Second)
 
 	// runner：同步 copyfile，ctx deadline = RCLONE_TIMEOUT（HTTP 断开即中止，防双写）。
+	// GroupPoolSize=Workers：每个并发传输借一个独立 stats group，group 总数恒定=Workers，
+	// rcd 的 StatsInfo 数封顶（消灭 per-call 唯一 group 导致的 StatsInfo 无界泄漏 → OOM）。
 	run := worker.NewRunner(rcdClient, worker.RunnerConfig{
-		Timeout: time.Duration(cfg.RcloneTimeout) * time.Second,
+		Timeout:       time.Duration(cfg.RcloneTimeout) * time.Second,
+		GroupPoolSize: cfg.Workers,
 	})
 
 	store := status.NewStore(ddbClient, cfg.StatusTable, cfg.HeartbeatTable)

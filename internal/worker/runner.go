@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/aws-samples/sample-data-transfer-tool/internal/classify"
@@ -18,28 +17,41 @@ type RunnerConfig struct {
 	// Timeout 单次传输上限 = RCLONE_TIMEOUT_SECONDS（必须 ≤ 0.7×visibility）。
 	// 同步调用以此为 ctx deadline：到点 HTTP 断开 → rcd 传输中止（防双写）。
 	Timeout time.Duration
+	// GroupPoolSize stats group 池大小。rcd 为每个唯一 _group 常驻一个 StatsInfo，
+	// 且该对象即便 stats-delete 也不被回收 → per-call 用唯一 group 会随文件数无界
+	// 泄漏（实测 64G OOM 的根因）。改用固定大小的 group 池：group 总数恒定 = 池大小，
+	// rcd 的 StatsInfo 数封顶，内存随累计文件数稳定不涨（实测验证）。应 ≈ Workers，
+	// 使每个并发传输借到独立 group、统计互不串扰。
+	GroupPoolSize int
 }
 
 // Runner 用 rcd 客户端同步执行一次传输并归类四态。实现 Effects.RunCopy。
 type Runner struct {
-	client  *rcd.Client
-	cfg     RunnerConfig
-	now     func() time.Time // 可注入时钟，便于测试 wall-clock 耗时
-	groupID atomic.Int64     // 单调递增，生成唯一 stats group
+	client *rcd.Client
+	cfg    RunnerConfig
+	now    func() time.Time // 可注入时钟，便于测试 wall-clock 耗时
+	groups chan string      // 固定大小的 stats group 池（借出独占→统计精确，归还复用→不泄漏）
 }
 
-// NewRunner 构造。
+// NewRunner 构造。预填一个固定大小的 stats group 池（默认 64）。
 func NewRunner(client *rcd.Client, cfg RunnerConfig) *Runner {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30240 * time.Second // 0.7×43200 兜底
 	}
-	return &Runner{client: client, cfg: cfg, now: time.Now}
+	if cfg.GroupPoolSize <= 0 {
+		cfg.GroupPoolSize = 64
+	}
+	groups := make(chan string, cfg.GroupPoolSize)
+	for i := 0; i < cfg.GroupPoolSize; i++ {
+		groups <- "go-worker-" + strconv.Itoa(i)
+	}
+	return &Runner{client: client, cfg: cfg, now: time.Now, groups: groups}
 }
 
-// nextGroup 生成本进程内唯一的 stats group 名（并发安全）。
-func (r *Runner) nextGroup() string {
-	return "go-worker-" + strconv.FormatInt(r.groupID.Add(1), 10)
-}
+// borrowGroup 从池借一个 group（阻塞直到有空闲），releaseGroup 归还。借出期间该 group
+// 由当前 goroutine 独占 → 可用「传输前后 group 累计字节之差」精确归因本次传输字节。
+func (r *Runner) borrowGroup() string  { return <-r.groups }
+func (r *Runner) releaseGroup(g string) { r.groups <- g }
 
 // RunCopy 同步执行 copyfile/deletefile，阻塞到完成，返回四态。
 //
@@ -53,33 +65,36 @@ func (r *Runner) RunCopy(ctx context.Context, msg message.TransferMessage) model
 	tctx, cancel := context.WithTimeout(ctx, r.cfg.Timeout)
 	defer cancel()
 
-	// 每次传输唯一 stats group：传完按 group 查 rcd 真实字节/速率（object_size 是
-	// 不可靠的 SQS 属性、常为 0，故弃用）。wall-clock 仍兜底测端到端耗时。
-	group := r.nextGroup()
+	// 从池借一个 stats group（独占到归还）。group 总数恒定=池大小 → rcd 的 StatsInfo
+	// 数封顶，不随文件数无界泄漏（per-call 唯一 group 才是 OOM 根因）。
+	group := r.borrowGroup()
+	defer r.releaseGroup(group)
+
+	// 传输前 reset 该 group 计数（独占借出，安全）：传后读 bytes 即本次传输字节，
+	// 无累计、无溢出、不受 rcd 重启基准失效影响。reset 只清计数不删 StatsInfo，不泄漏。
+	if msg.Op == model.OpCopy || msg.Op == model.OpRefresh {
+		_ = r.client.ResetStatsGroup(context.Background(), group)
+	}
+
 	start := r.now()
 	err := r.execute(tctx, msg, group)
 	elapsed := r.now().Sub(start).Seconds()
 
 	if err == nil {
-		// 同步成功。从 rcd 该 group 查真实传输字节/速率（copy/refresh 才有；delete 无字节）。
+		// 同步成功。group 传输前已清零，当前 bytes 即本次传输字节。
 		stats := model.TransferStats{ElapsedSeconds: elapsed}
 		if msg.Op == model.OpCopy || msg.Op == model.OpRefresh {
 			if gs, e := r.client.StatsByGroup(context.Background(), group); e == nil {
 				stats.Bytes = gs.Bytes
-				if gs.ElapsedTime > 0 {
-					stats.ElapsedSeconds = gs.ElapsedTime // rcd 实测传输时长更准
-				}
 				if stats.ElapsedSeconds > 0 {
-					stats.Speed = float64(gs.Bytes) / stats.ElapsedSeconds
+					stats.Speed = float64(stats.Bytes) / stats.ElapsedSeconds
 				}
 			}
 		}
-		r.client.DeleteStatsGroup(context.Background(), group) // 用完即清，防内存涨
 		return model.RunResult{
 			State: model.StateSuccess, ExitCode: 0, CmdStr: cmdStr, Stats: stats,
 		}
 	}
-	r.client.DeleteStatsGroup(context.Background(), group) // 失败也清理 group
 
 	// 区分三类失败：父 ctx 取消（停机）/ 超时 / rcd 业务错误。
 	errText := err.Error()

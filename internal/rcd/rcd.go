@@ -88,9 +88,12 @@ func (c *Client) StatsByGroup(ctx context.Context, group string) (GroupStats, er
 	return s, err
 }
 
-// DeleteStatsGroup 删除某 group 的累积统计（用完即清，防 rcd 内存随 group 数增长）。
-func (c *Client) DeleteStatsGroup(ctx context.Context, group string) {
-	_ = c.post(ctx, "/core/stats-delete", map[string]any{"group": group}, nil)
+// ResetStatsGroup 清零指定 group 的计数（core/stats-reset {group}）。仅清 bytes/transfers
+// 等计数与 startedTransfers，**不删除 group 的 StatsInfo 对象**（对象在 runner 的 group 池
+// 里长期复用，不重新引入 per-call StatsInfo 泄漏）。传输前 reset、传输后读 bytes，即得本次
+// 传输字节，无需累计差值（避免长跑累计值无界增长 / rcd 重启后基准失效等边界）。
+func (c *Client) ResetStatsGroup(ctx context.Context, group string) error {
+	return c.post(ctx, "/core/stats-reset", map[string]any{"group": group}, nil)
 }
 
 // SetBwLimit 运行时设 rcd 全局带宽限速。rate 形如 "100M"，"off" 解除。

@@ -20,6 +20,7 @@ type fakeRCDServer struct {
 	delay       time.Duration // copyfile 阻塞时长（模拟传输耗时）
 	errBody     string        // 非空 = 业务失败，返回该 error
 	gotIgnoreTm bool          // 捕获最近 copyfile 是否带 _config.IgnoreTimes
+	groupBytes  int64         // 模拟 group 累计字节（copyfile 成功后 +12345，差值=本次）
 	srv         *httptest.Server
 }
 
@@ -50,10 +51,25 @@ func newFakeRCDServer(t *testing.T) *fakeRCDServer {
 				_ = json.NewEncoder(w).Encode(map[string]any{"error": errBody})
 				return
 			}
+			// 成功：模拟本次传输使该 group 字节变为 12345（传前已被 stats-reset 清零）。
+			f.mu.Lock()
+			f.groupBytes = 12345
+			f.mu.Unlock()
+		}
+		if r.URL.Path == "/core/stats-reset" {
+			// runner 传输前清零该 group（独占借出）。
+			f.mu.Lock()
+			f.groupBytes = 0
+			f.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+			return
 		}
 		if r.URL.Path == "/core/stats" {
-			// 模拟 group stats：固定返回 12345 字节（验证 runner 用 rcd 真实字节）。
-			_ = json.NewEncoder(w).Encode(map[string]any{"bytes": 12345, "transfers": 1, "elapsedTime": 0.5, "speed": 24690})
+			// 传输后读该 group：已清零→本次传输累计，bytes 即本次字节。
+			f.mu.Lock()
+			b := f.groupBytes
+			f.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"bytes": b, "transfers": 1, "elapsedTime": 0.5, "speed": 24690})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{})
