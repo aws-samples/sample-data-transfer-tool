@@ -1,0 +1,1064 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GCS/S3 -> S3 transfer agent, SINGLE-CLUSTER template. One stack = one independent cluster
+  (own SQS queue+DLQ, DynamoDB status+heartbeat tables, AIMD rate-limit Lambda, log groups, dashboard).
+  Deploy this stack N times (one per cluster) for N independent clusters. cfn-init at boot downloads
+  the prebuilt go-worker binary from a GitHub release and runs rclone-rcd + go-worker via systemd
+  (rcd-based: connection-pool reuse kills per-file fork+TLS overhead). TRANSFER side only; filling SQS is separate.
+
+Metadata:
+  # Console 按下列分组+顺序显示参数(部署准备顺序:网络 → 栈外预建资源 → 本集群定义 →
+  # 计算容量 → 代码来源 → 可选)。Parameters 段定义顺序与此一致。
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: '1) Network (customer-provided, NOT created by this stack)' }
+        Parameters: [VpcId, WorkerSubnetIds, EipPoolTagKey, EipPoolTagValue]
+      - Label: { default: '2) Pre-created external resources (create BEFORE deploying)' }
+        Parameters: [GcsHmacSecretArn, ArtifactsBucket, LambdaS3Key]
+      - Label: { default: '3) This cluster: destination & rate limit' }
+        Parameters: [TargetBucketPrefix, RatelimitTargetGbps, RatelimitTpsTarget]
+      - Label: { default: '4) Compute capacity' }
+        Parameters: [InstanceType, CpuArch, InstanceCount, WorkerCount, WorkerThreads, RootVolumeSize]
+      - Label: { default: '5) Code sources (go-worker binary + rclone binary)' }
+        Parameters: [GitRepoUrl, GoWorkerReleaseTag, RcloneS3Key]
+      - Label: { default: '6) Optional' }
+        Parameters: [KeyPairName, ProjectTag]
+    ParameterLabels:
+      VpcId: { default: VPC ID }
+      WorkerSubnetIds: { default: Worker subnet IDs (2+ AZs) }
+      EipPoolTagKey: { default: EIP pool tag key (optional) }
+      EipPoolTagValue: { default: EIP pool tag value (optional) }
+      GcsHmacSecretArn: { default: GCS HMAC secret ARN }
+      ArtifactsBucket: { default: Ops/artifacts bucket }
+      LambdaS3Key: { default: Rate-limit Lambda zip key }
+      TargetBucketPrefix: { default: Destination bucket prefix }
+      RatelimitTargetGbps: { default: Rate-limit target (Gbps) }
+      RatelimitTpsTarget: { default: Rate-limit TPS target (transactions/sec) }
+      InstanceType: { default: EC2 instance type }
+      CpuArch: { default: CPU architecture }
+      InstanceCount: { default: Instance count (ASG desired) }
+      WorkerCount: { default: DEPRECATED (keep 1 for go-worker) }
+      WorkerThreads: { default: Concurrent transfers per host (= rcd --transfers) }
+      RootVolumeSize: { default: Root EBS size (GiB) }
+      GitRepoUrl: { default: GitHub repo (for go-worker release download) }
+      GoWorkerReleaseTag: { default: go-worker release tag }
+      RcloneS3Key: { default: Self-compiled rclone S3 key (optional) }
+      KeyPairName: { default: SSH key pair (optional) }
+      ProjectTag: { default: Project tag }
+
+Parameters:
+  # ═══════════════ 1) Network (customer-provided) ═══════════════
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >-
+      Customer-provided VPC ID. The worker security group is created inside this VPC, which MUST
+      have EnableDnsSupport + EnableDnsHostnames enabled (required for Interface Endpoint private DNS).
+      e.g. vpc-03ca342bb146e6bdb
+  WorkerSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Subnet IDs the workers run in (recommend 2+ AZs). MUST reach the public internet to download
+      from GCS (via NAT or IGW), and their route tables MUST be associated with the S3/DynamoDB
+      Gateway Endpoints. See README. e.g. subnet-02bf3b7dad34e6f5c,subnet-0796623cfc7db43b0
+  EipPoolTagKey:
+    Type: String
+    Default: ''
+    AllowedValues: ['', 'eiptags']
+    Description: >-
+      OPTIONAL. Tag KEY identifying a pre-allocated Elastic IP pool (dropdown). Pick 'eiptags' to
+      enable EIP association: when BOTH EipPoolTagKey and EipPoolTagValue are set, each worker
+      associates a free EIP from the pool at boot (replacing the auto-assigned public IP), so
+      outbound traffic egresses from the customer's contiguous EIP range (for GCS source-IP
+      allowlisting). Requires the subnet to route 0.0.0.0/0 directly to an IGW (public subnet) --
+      EIP has no effect on instances egressing via NAT. Leave BLANK to keep the VPC auto-assigned
+      public IP (default). The stack does NOT create or release EIPs -- customer pre-allocates and tags.
+  EipPoolTagValue:
+    Type: String
+    Default: ''
+    AllowedValues: ['', 'poo1_1', 'poo1_2']
+    Description: >-
+      OPTIONAL. Tag VALUE of the pre-allocated EIP pool (dropdown), paired with EipPoolTagKey. The
+      worker filters EIPs by tag:<EipPoolTagKey>=<EipPoolTagValue>, picks one with no AssociationId,
+      and associates it. Pool size MUST be >= ASG MaxSize, else scale-out boots fail (by design: a
+      worker that cannot get a pool EIP fails cfn-init rather than egress from a non-allowlisted IP).
+      Leave BLANK (with EipPoolTagKey blank) to disable EIP association.
+
+  # ═══════════════ 2) Pre-created external resources (create BEFORE deploying) ═══════════════
+  GcsHmacSecretArn:
+    Type: String
+    Description: >-
+      ARN of a pre-created Secrets Manager secret holding the GCS HMAC key as JSON
+      {"access_key_id":"GOOG...","secret_access_key":"..."}. Created OUTSIDE this stack (can be
+      shared across cluster stacks). cfn-init reads it to build rclone's S3-compatible [gcs] backend.
+      Fill in your own secret ARN. e.g. arn:aws:secretsmanager:<region>:<account-id>:secret:gcs-hmac-shared-XXXXXX
+  ArtifactsBucket:
+    Type: String
+    Default: s3euprodloginventory
+    Description: >-
+      Ops/artifacts bucket holding deploy artifacts under the ops/ prefix: the rate-limit Lambda zip
+      (always) and an optional self-compiled rclone binary. The worker role gets s3:GetObject on it;
+      the Lambda Code is loaded from it. Created OUTSIDE this stack (can be shared across stacks).
+      e.g. s3euprodloginventory
+  LambdaS3Key:
+    Type: String
+    Default: ops/ratelimit-controller-goworker.zip
+    Description: >-
+      S3 key of the GO-CLUSTER rate-limit Lambda zip inside ArtifactsBucket, under the ops/ prefix.
+      This build contains the rcd-mode division (per-EC2, not per-rclone-process) required by
+      go-worker. Default points at the pre-uploaded go-cluster zip.
+      e.g. ops/ratelimit-controller-goworker.zip
+
+  # ═══════════════ 3) This cluster: destination & rate limit ═══════════════
+  TargetBucketPrefix:
+    Type: String
+    Description: >-
+      Destination S3 bucket-name prefix for this cluster; worker IAM write scope = arn:aws:s3:::<prefix>*.
+      e.g. migration-dest-
+  RatelimitTargetGbps:
+    Type: String
+    Default: '300'
+    Description: Fleet-wide throughput redline (Gbps) for this cluster's AIMD auto mode. 0 = unlimited. e.g. 400
+  RatelimitTpsTarget:
+    Type: String
+    Default: '10000'
+    Description: >-
+      Fleet-wide total transactions/sec target (or 'off'). GO-CLUSTER (rcd) mode: the controller
+      Lambda divides this by the live INSTANCE count every 60s and writes the per-EC2 tpslimit (each
+      EC2 = one rcd daemon with a global TPS limit; go-worker applies it via rcd options/set). Default
+      10000 = loose cap (large files never hit it; guards small-file QPS against GCS/S3 rate limits). e.g. 10000
+
+  # ═══════════════ 4) Compute capacity ═══════════════
+  InstanceType:
+    Type: String
+    Default: c8in.8xlarge
+    Description: EC2 instance type (network-optimized recommended for go-worker download+upload). MUST match CpuArch. e.g. c8in.8xlarge (x86_64, 32 vCPU, 50Gbps)
+  CpuArch:
+    Type: String
+    Default: x86_64
+    AllowedValues: [arm64, x86_64]
+    Description: CPU architecture; MUST match InstanceType (c8in/c6in/m6in=x86_64, c8gn/c7gn=arm64) AND RcloneS3Key. e.g. x86_64
+  InstanceCount:
+    Type: Number
+    Default: 1
+    Description: This cluster's ASG DesiredCapacity (number of worker hosts). e.g. 1
+  WorkerCount:
+    Type: Number
+    Default: 1
+    Description: >-
+      DEPRECATED for go-worker (single process, no GIL). Kept = 1 so the rate-limit controller's
+      process-count math (instances x WorkerCount x WorkerThreads) reduces to instances x WorkerThreads
+      = the real concurrent transfer count. Do NOT raise it. e.g. 1
+  WorkerThreads:
+    Type: Number
+    Default: 64
+    Description: >-
+      go-worker concurrent transfer units per host = WORKER_GOROUTINES, and MUST equal rcd --transfers
+      (submit vs execute alignment, else jobs queue inside rcd and hit poll deadline). Tune by the
+      GCS/S3 429 knee. HARD CONSTRAINT MaxSize(449) x WorkerThreads <= 115000 (in-flight cap). e.g. 64
+  RootVolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 30
+    Description: Root EBS volume size (GiB). e.g. 100
+
+  # ═══════════════ 5) Code sources ═══════════════
+  GitRepoUrl:
+    Type: String
+    Default: https://github.com/aws-samples/sample-data-transfer-tool
+    Description: >-
+      GitHub repo (no .git suffix) hosting the go-worker release. cfn-init downloads the prebuilt
+      binary from this repo's release assets at boot — NO git clone / pip needed (self-contained
+      static binary). e.g. https://github.com/aws-samples/sample-data-transfer-tool
+  GoWorkerReleaseTag:
+    Type: String
+    Default: go-worker-v0.1.0-528a3c3
+    Description: >-
+      Release tag whose assets hold the go-worker binary. cfn-init downloads
+      go-worker-linux-<arch> (arch from CpuArch) from
+      <GitRepoUrl>/releases/download/<tag>/go-worker-linux-<arch>. Must be a PUBLISHED release.
+      e.g. go-worker-v0.1.0-528a3c3
+  RcloneS3Key:
+    Type: String
+    Default: ops/rclone-v1.74.3-x86_64
+    Description: >-
+      Optional FULL S3 key of a self-compiled rclone binary INSIDE ArtifactsBucket under the ops/
+      prefix (same bucket + same key-only format as LambdaS3Key). MUST match CpuArch — pick the
+      binary for this stack's architecture yourself (x86_64 vs arm64 binaries are not interchangeable;
+      a mismatch causes 'exec format error' at boot). DEFAULT is the x86_64 build (matches default
+      InstanceType c8in.8xlarge); for arm64 stacks change to ops/rclone-v1.74.3-arm64. Two arch
+      builds are kept in the bucket; fill the one matching CpuArch. e.g. ops/rclone-v1.74.3-x86_64 (for CpuArch=x86_64) or
+      ops/rclone-v1.74.3-arm64 (for CpuArch=arm64). Empty = install official build via rclone.org/install.sh.
+
+  # ═══════════════ 6) Optional ═══════════════
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: SSH key pair name for the workers (empty = no SSH key attached). e.g. (leave empty, or my-keypair)
+  ProjectTag:
+    Type: String
+    Default: gcs-s3-migration
+    Description: Project tag value, used for cost allocation + bulk cleanup-by-tag after migration. e.g. gcs-s3-migration
+
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  HasRcloneS3Key: !Not [!Equals [!Ref RcloneS3Key, '']]
+  # EIP 关联仅在 tag key 与 value 都非空时启用（两者缺一即用 VPC 自动公网 IP）。
+  HasEipPool: !And
+    - !Not [!Equals [!Ref EipPoolTagKey, '']]
+    - !Not [!Equals [!Ref EipPoolTagValue, '']]
+
+Resources:
+  # ═══════════════════════════ This stack's resources ═══════════════════════════
+  # Network is customer-provided (NOT created here): VPC / subnets / IGW / routes / NAT / VPC Endpoints.
+  # See README "Customer Network Prerequisites". This stack only creates each cluster's worker SG.
+
+  # GCS HMAC credential: pre-created secret OUTSIDE this stack, referenced by GcsHmacSecretArn.
+  # cfn-init reads it to build rclone's S3-compatible [gcs] backend (see AgentLaunchTemplate).
+
+  # ─────────────────────────── DynamoDB (this stack's own tables) ───────────────────────────
+  # status PK = md5(source)#source (sharded) so concurrent writes never hot-spot within the table;
+  # heartbeat PK = instance_id#worker_index (per-process unique).
+  TransferStatusTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-transfer-status'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: source_hash, AttributeType: S }
+        - { AttributeName: attempt_timestamp, AttributeType: S }
+      KeySchema:
+        - { AttributeName: source_hash, KeyType: HASH }
+        - { AttributeName: attempt_timestamp, KeyType: RANGE }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Component, Value: state }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  HeartbeatTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-heartbeat'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: instance_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: instance_id, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Component, Value: state }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  # ─────────────────────────── Log groups (this stack's own) ───────────────────────────
+  # WorkerLogGroup = pure EMF JSON (metrics auto-extracted). WorkerOpsLogGroup = ops logs (DIAG lines etc).
+  # MUST stay separate: mixing ops logs into the EMF group would break metric extraction.
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/migration/${AWS::StackName}/worker'
+      RetentionInDays: 7
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Component, Value: monitoring }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  WorkerOpsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/migration/${AWS::StackName}/worker-ops'
+      RetentionInDays: 7
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Component, Value: monitoring }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  # ═══════════════════════════ CLUSTER: Primary ═══════════════════════════
+  MigrationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-queue-dlq'
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Cluster, Value: !Ref AWS::StackName }
+        - { Key: Component, Value: queue }
+        - { Key: ManagedBy, Value: cloudformation }
+  MigrationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-queue'
+      VisibilityTimeout: 43200
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MigrationDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Cluster, Value: !Ref AWS::StackName }
+        - { Key: Component, Value: queue }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  AgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-agent-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: agent-perms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes, sqs:GetQueueUrl]
+                Resource:
+                  - !GetAtt MigrationQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !GetAtt TransferStatusTable.Arn
+                  - !GetAtt HeartbeatTable.Arn
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !Sub 'arn:aws:s3:::${TargetBucketPrefix}*'
+                  - !Sub 'arn:aws:s3:::${TargetBucketPrefix}*/*'
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub 'arn:aws:s3:::${ArtifactsBucket}/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GcsHmacSecretArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:PutRetentionPolicy
+                Resource:
+                  - !GetAtt WorkerLogGroup.Arn
+                  - !Sub '${WorkerLogGroup.Arn}:*'
+                  - !GetAtt WorkerOpsLogGroup.Arn
+                  - !Sub '${WorkerOpsLogGroup.Arn}:*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:DescribeLogGroups]
+                Resource: '*'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: CWAgent
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/migration/${AWS::StackName}/ratelimit/*'
+              # EIP 自助关联（仅 HasEipPool 时存在）。Describe/Associate 不支持资源级限定，
+              # 必须 Resource:'*'。不授 AllocateAddress（不动态分配，杜绝孤儿 EIP 泄漏计费）。
+              - !If
+                - HasEipPool
+                - Effect: Allow
+                  Action: [ec2:DescribeAddresses, ec2:AssociateAddress]
+                  Resource: '*'
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Cluster, Value: !Ref AWS::StackName }
+        - { Key: Component, Value: iam }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  AgentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AgentRole]
+
+  AgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'rclone transfer agent (egress only)'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS out (GCS download, VPC endpoints, SSM, package install)
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-worker-sg' }
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Cluster, Value: !Ref AWS::StackName }
+        - { Key: Component, Value: network }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  AgentLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default: [install, fetch_code, write_config, cw_agent, start]
+        install:
+          commands:
+            00_retry_helper:
+              command: |
+                cat > /usr/local/bin/retry.sh <<'RETRY'
+                #!/bin/bash
+                retry() {
+                  local max=$1; shift
+                  local n=1 delay=5
+                  until "$@"; do
+                    rc=$?
+                    if [ $n -ge $max ]; then
+                      echo "retry: '$*' failed $max times, giving up (rc=$rc)" >&2
+                      return $rc
+                    fi
+                    echo "retry: '$*' attempt $n failed (rc=$rc), retrying in ${delay}s" >&2
+                    sleep $delay; n=$((n+1)); delay=$((delay*2))
+                  done
+                }
+                RETRY
+                chmod +x /usr/local/bin/retry.sh
+            01_dnf_packages:
+              command: |
+                source /usr/local/bin/retry.sh
+                retry 5 dnf makecache --refresh
+                # go-worker 是自包含静态二进制：无需 git/python/pip，仅需 tar/curl 取 release。
+                retry 5 dnf install -y tar
+            02_rclone:
+              command: !Sub |
+                source /usr/local/bin/retry.sh
+                RCLONE_S3_KEY="${RcloneS3Key}"
+                if [ -n "$RCLONE_S3_KEY" ]; then
+                  # 自编译 rclone:RcloneS3Key 是完整 key(已含架构,部署时按 CpuArch 自行选对),
+                  # 从 ArtifactsBucket 拉到 /usr/local/bin(优先于官网),systemd 注入 RCLONE_BIN 指向它。
+                  # 与 LambdaS3Key 同格式:都是 ArtifactsBucket 内的完整相对 key,统一一个桶。
+                  retry 5 aws s3 cp "s3://${ArtifactsBucket}/$RCLONE_S3_KEY" /usr/local/bin/rclone
+                  chmod +x /usr/local/bin/rclone
+                  /usr/local/bin/rclone version
+                else
+                  command -v rclone || retry 5 bash -c 'curl -fsSL https://rclone.org/install.sh | bash'
+                fi
+            03_cloudwatch_agent:
+              command: |
+                source /usr/local/bin/retry.sh
+                command -v amazon-cloudwatch-agent-ctl || retry 5 dnf install -y amazon-cloudwatch-agent
+        fetch_code:
+          commands:
+            01_download_goworker:
+              command: !Sub |
+                set -e
+                source /usr/local/bin/retry.sh
+                # go-worker release 资产按架构命名：go-worker-linux-{amd64|arm64}。
+                # CpuArch 是 x86_64/arm64；release 用 Go 的 amd64/arm64，做一次映射。
+                case "${CpuArch}" in
+                  x86_64) GOARCH=amd64 ;;
+                  arm64)  GOARCH=arm64 ;;
+                  *) echo "未知 CpuArch=${CpuArch}" >&2; exit 1 ;;
+                esac
+                URL="${GitRepoUrl}/releases/download/${GoWorkerReleaseTag}/go-worker-linux-$GOARCH"
+                retry 5 curl -fsSL -o /usr/local/bin/go-worker "$URL"
+                chmod +x /usr/local/bin/go-worker
+                # 自检：能打印即下载成功（无 --config 退出码非 0 属正常，仅验证可执行）。
+                /usr/local/bin/go-worker --help >/dev/null 2>&1 || true
+                test -x /usr/local/bin/go-worker
+        write_config:
+          commands:
+            01_rclone_conf:
+              command: !Sub |
+                set -e
+                # GCS 经 S3-compatible（HMAC）端点访问：native backend 会规整斜杠导致含 // / 前导斜杠
+                # 的对象 404，XML API 保留字面 key 可正常传输。remote 名仍为 [gcs]，消息/feed 不变。
+                HMAC_JSON=$(aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${GcsHmacSecretArn} --query SecretString --output text)
+                GCS_AK=$(printf '%s' "$HMAC_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_key_id"])')
+                GCS_SK=$(printf '%s' "$HMAC_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["secret_access_key"])')
+                for H in /root /home/ec2-user; do
+                  mkdir -p $H/.config/rclone
+                  cat > $H/.config/rclone/rclone.conf <<EOF
+                [gcs]
+                type = s3
+                provider = GCS
+                access_key_id = $GCS_AK
+                secret_access_key = $GCS_SK
+                endpoint = https://storage.googleapis.com
+
+                [s3]
+                type = s3
+                provider = AWS
+                env_auth = true
+                region = ${AWS::Region}
+                EOF
+                  chmod 600 $H/.config/rclone/rclone.conf
+                done
+                unset GCS_AK GCS_SK HMAC_JSON
+                chown -R ec2-user:ec2-user /home/ec2-user/.config
+            02_systemd_unit:
+              command: !Sub
+                - |
+                  mkdir -p /var/log/migration
+                  # 本机 rcd 鉴权口令：随机生成存 EnvironmentFile（即便 127.0.0.1，访问 remote 的 rc
+                  # 方法默认要鉴权）。仅存在 600 的 EnvironmentFile，不落进 644 unit 文件（不明文外泄）。
+                  RCD_PASS=$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')
+                  printf 'RCD_PASS=%s\n' "$RCD_PASS" > /etc/migration-rcd-pass
+                  chmod 600 /etc/migration-rcd-pass
+
+                  # ① rclone rcd 守护进程：所有传输走 operations/copyfile，连接池复用（消灭每文件 fork+握手）。
+                  # 全套 rclone flag 在此一次给全；per-call 仅用 _config 覆盖 bwlimit/tpslimit。
+                  # 口令经 EnvironmentFile 注入，ExecStart 用 ${!RCD_PASS}（systemd 运行时展开）。
+                  # ⚠️ --rc-job-expire-duration 必须短（1m）：rclone 把**每个** rc 调用都登记为 job
+                  # 并在内存保留到 expire（同步调用也算 job）。同步模式下 worker 拿到结果即不再查 job，
+                  # 无需长保留。设长（曾误设 13h）会让高吞吐下几十万已完成 job 尸体常驻内存 → 持续涨
+                  # 到 OOM（即便当前无传输/队列空，内存仍涨——客户机实测 8min 涨 14GB）。
+                  cat > /etc/systemd/system/rclone-rcd.service <<EOF
+                  [Unit]
+                  Description=rclone rcd daemon (shared transfer engine)
+                  After=network-online.target
+                  Wants=network-online.target
+                  [Service]
+                  Type=simple
+                  User=root
+                  EnvironmentFile=/etc/migration-rcd-pass
+                  ExecStart=${RcloneBinPath} rcd --rc-addr 127.0.0.1:5572 \\
+                    --rc-user worker --rc-pass \${!RCD_PASS} \\
+                    --config /root/.config/rclone/rclone.conf \\
+                    --rc-job-expire-duration 1m \\
+                    --transfers ${WorkerThreads} \\
+                    --s3-upload-cutoff 100M --s3-chunk-size 64M --s3-upload-concurrency 8 \\
+                    --buffer-size 32M --max-buffer-memory 2G --use-mmap \\
+                    --header-upload "x-amz-checksum-algorithm: CRC32C" \\
+                    --header-upload "x-amz-checksum-type: FULL_OBJECT" \\
+                    --s3-no-check-bucket --s3-disable-checksum --s3-no-head \\
+                    --metadata --s3-encoding Slash,InvalidUtf8 \\
+                    --retries 3 --low-level-retries 10 --no-traverse \\
+                    --use-json-log --log-level INFO
+                  Restart=always
+                  RestartSec=5
+                  LimitNOFILE=1048576
+                  [Install]
+                  WantedBy=multi-user.target
+                  EOF
+
+                  # ② go-worker：单进程多 goroutine（WORKER_GOROUTINES ≈ rcd --transfers）。
+                  # 依赖 rcd，启动时探 rc/noop 就绪才消费。
+                  # 日志双流：EMF→stdout→worker-emf log（CW 抽取指标）；分级运维日志（WARNING+）
+                  # → OPS_LOG_PATH=worker-ops-0.log（CW 采集 worker-ops 组，失败/poison 不登机可查）。
+                  # watchdog：Type=notify + WatchdogSec=120 —— go-worker 周期 sd_notify(WATCHDOG=1)，
+                  # 僵死（receiver 不推进）则停报 → systemd 120s 超时杀进程重启（在途消息靠 SQS 重投）。
+                  cat > /etc/systemd/system/go-worker.service <<EOF
+                  [Unit]
+                  Description=go-worker (rcd-based SQS migration consumer)
+                  After=rclone-rcd.service network-online.target
+                  Requires=rclone-rcd.service
+                  [Service]
+                  Type=notify
+                  WatchdogSec=120
+                  User=root
+                  EnvironmentFile=/etc/migration-rcd-pass
+                  Environment="AWS_REGION=${AWS::Region}"
+                  Environment="QUEUE_URL=${MigrationQueue}"
+                  Environment="DYNAMODB_TABLE=${TransferStatusTable}"
+                  Environment="HEARTBEAT_TABLE=${HeartbeatTable}"
+                  Environment="RCD_ADDR=127.0.0.1:5572"
+                  Environment="RCD_USER=worker"
+                  Environment="WORKER_GOROUTINES=${WorkerThreads}"
+                  Environment="RECEIVER_GOROUTINES=2"
+                  Environment="RATELIMIT_BWLIMIT_PARAM=${RatelimitBwlimitParam}"
+                  Environment="RATELIMIT_TPSLIMIT_PARAM=${RatelimitTpslimitParam}"
+                  Environment="QUEUE_VISIBILITY_TIMEOUT=43200"
+                  Environment="RCLONE_TIMEOUT_SECONDS=30240"
+                  Environment="OPS_LOG_PATH=/var/log/migration/worker-ops-0.log"
+                  Environment="AWS_METADATA_SERVICE_NUM_ATTEMPTS=5"
+                  Environment="AWS_METADATA_SERVICE_TIMEOUT=10"
+                  ExecStart=/usr/local/bin/go-worker
+                  StandardOutput=append:/var/log/migration/worker-emf-0.log
+                  StandardError=journal
+                  Restart=always
+                  RestartSec=10
+                  TimeoutStopSec=60
+                  KillSignal=SIGTERM
+                  [Install]
+                  WantedBy=multi-user.target
+                  EOF
+                  systemctl daemon-reload
+                - RatelimitBwlimitParam: !Ref RatelimitBwlimitSsm
+                  RatelimitTpslimitParam: !Ref RatelimitTpslimitSsm
+                  RcloneBinPath: !If [HasRcloneS3Key, '/usr/local/bin/rclone', '/usr/bin/rclone']
+        cw_agent:
+          files:
+            /opt/aws/amazon-cloudwatch-agent/etc/migration-cwagent.json:
+              mode: '000644'
+              owner: root
+              group: root
+              content: !Sub |
+                {
+                  "agent": { "run_as_user": "root" },
+                  "metrics": {
+                    "namespace": "CWAgent",
+                    "append_dimensions": { "InstanceId": "${!aws:InstanceId}", "AutoScalingGroupName": "${!aws:AutoScalingGroupName}" },
+                    "aggregation_dimensions": [["InstanceId"], ["AutoScalingGroupName"]],
+                    "metrics_collected": {
+                      "mem": { "measurement": ["mem_used_percent"], "metrics_collection_interval": 60 },
+                      "cpu": { "measurement": ["cpu_usage_active"], "totalcpu": true, "metrics_collection_interval": 60 },
+                      "disk": { "measurement": ["used_percent"], "resources": ["/"], "metrics_collection_interval": 60 },
+                      "diskio": { "measurement": ["io_time", "write_bytes", "read_bytes"], "resources": ["*"], "metrics_collection_interval": 60 }
+                    }
+                  },
+                  "logs": {
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          {
+                            "file_path": "/var/log/migration/worker-emf-*.log",
+                            "log_group_name": "${WorkerLogGroup}",
+                            "log_stream_name": "{instance_id}",
+                            "retention_in_days": 7
+                          },
+                          {
+                            "file_path": "/var/log/migration/worker-ops-*.log",
+                            "log_group_name": "${WorkerOpsLogGroup}",
+                            "log_stream_name": "{instance_id}",
+                            "retention_in_days": 7
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+          commands:
+            01_start_cwagent:
+              command: "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/migration-cwagent.json"
+        start:
+          commands:
+            01_start_workers:
+              command: |
+                set -e
+                # 先起 rcd 守护进程，等 rc/noop 就绪（最多 30s），再起 go-worker。
+                # go-worker 单进程取代旧的 16 进程错峰启动（无 GIL，无 IMDS 抢爆问题）。
+                systemctl enable --now rclone-rcd.service
+                . /etc/migration-rcd-pass   # 载入 RCD_PASS=xxx
+                for i in $(seq 1 60); do
+                  if curl -fsS -u worker:"$RCD_PASS" -X POST http://127.0.0.1:5572/rc/noop >/dev/null 2>&1; then
+                    break
+                  fi
+                  sleep 0.5
+                done
+                curl -fsS -u worker:"$RCD_PASS" -X POST http://127.0.0.1:5572/rc/noop >/dev/null
+                systemctl enable --now go-worker.service
+                sleep 2
+                systemctl is-active rclone-rcd.service
+                systemctl is-active go-worker.service
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-lt'
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - { Key: Project, Value: !Ref ProjectTag }
+            - { Key: Stack, Value: !Ref 'AWS::StackName' }
+            - { Key: Cluster, Value: !Ref AWS::StackName }
+            - { Key: Component, Value: compute }
+            - { Key: ManagedBy, Value: cloudformation }
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-${CpuArch}}}'
+        InstanceType: !Ref InstanceType
+        Monitoring:
+          Enabled: true
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+        IamInstanceProfile: { Arn: !GetAtt AgentInstanceProfile.Arn }
+        SecurityGroupIds: [!GetAtt AgentSecurityGroup.GroupId]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '${AWS::StackName}-worker' }
+              - { Key: Project, Value: !Ref ProjectTag }
+              - { Key: Stack, Value: !Ref 'AWS::StackName' }
+              - { Key: Cluster, Value: !Ref AWS::StackName }
+              - { Key: Component, Value: compute }
+              - { Key: ManagedBy, Value: cloudformation }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub '${AWS::StackName}-worker-vol' }
+              - { Key: Project, Value: !Ref ProjectTag }
+              - { Key: Stack, Value: !Ref 'AWS::StackName' }
+              - { Key: Cluster, Value: !Ref AWS::StackName }
+              - { Key: Component, Value: compute }
+              - { Key: ManagedBy, Value: cloudformation }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -x
+            n=1; until dnf install -y aws-cfn-bootstrap || yum install -y aws-cfn-bootstrap; do
+              [ $n -ge 5 ] && break; echo "cfn-bootstrap attempt $n failed, backing off and retrying"; sleep $((n*5)); n=$((n+1));
+            done
+            # ── EIP 自助关联（仅当 EipPoolTagKey + EipPoolTagValue 都非空时执行）──
+            # 在 cfn-init 之前完成，确保 worker 起任何网络动作前已用上白名单内的固定 IP。
+            # 从 tag 标记的预建 EIP 池挑一个空闲(AssociationId 为空)的关联。
+            #
+            # 「乱抢」在正确性上不可能：--no-allow-reassociation 是服务端原子操作，EIP 已被占用
+            # 时调用直接失败，绝不会把别人的 EIP 抢走 → 永远不会两台共用一个 EIP。
+            #
+            # 大批量(如 ASG 一次拉起 100 台)的真实风险是 EC2 API 风暴，三层加固(不依赖实例数，
+            # 对任意扩/缩批次都稳)：
+            #  A. boot 抖动：关联前 sleep 0~JITTER 秒，把同时 boot 的实例在时间轴随机摊开 → 消解
+            #     thundering herd(瞬时并发从 N 压到个位数/秒)。固定窗口，不需预知本批多少台。
+            #  C. 区分失败类型：associate 命中限流(RequestLimitExceeded/Throttling)→ 指数退避；
+            #     命中「已被关联」(InvalidAddress.InUse/Resource.AlreadyAssociated)→ 立即试下一个，
+            #     不退避。避免把限流当被抢而狂重试火上浇油。
+            #  D. 每轮重新 describe + 限本轮尝试数：不拿着过时的大快照狂撞，每轮重新拉空闲列表，
+            #     单轮最多试 MAX_TRY_PER_ROUND 个候选就重新 describe。
+            # 池里无空闲 → cfn-signal 报失败 + 退出(实例不健康、不滚动起来)，绝不用非白名单 IP 出站。
+            if [ -n "${EipPoolTagKey}" ] && [ -n "${EipPoolTagValue}" ]; then
+              TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+              IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+              EIP_OK=0
+              # 参数收敛到最坏耗时 < cfn CreationPolicy 超时(PT15M)，留足余量。
+              JITTER=60; MAX_ROUNDS=20; MAX_TRY_PER_ROUND=5; BACKOFF=2
+              # A. boot 抖动：固定窗口内随机错峰(对任意批次大小都有效)
+              sleep $((RANDOM % JITTER))
+              for round in $(seq 1 $MAX_ROUNDS); do
+                # D. 每轮重新拉空闲快照(打散顺序，降低多台从同一个开始撞)
+                CAND=$(aws ec2 describe-addresses --region ${AWS::Region} \
+                  --filters "Name=tag:${EipPoolTagKey},Values=${EipPoolTagValue}" \
+                  --query "Addresses[?AssociationId==null].AllocationId" --output text 2>/dev/null | tr '\t' '\n' | shuf)
+                if [ -z "$CAND" ]; then sleep $((RANDOM % 5 + BACKOFF)); continue; fi
+                tries=0
+                for ALLOC in $CAND; do
+                  tries=$((tries+1)); [ $tries -gt $MAX_TRY_PER_ROUND ] && break
+                  ERR=$(aws ec2 associate-address --region ${AWS::Region} \
+                          --instance-id $IID --allocation-id $ALLOC --no-allow-reassociation 2>&1)
+                  if [ $? -eq 0 ]; then echo "EIP associated: $ALLOC"; EIP_OK=1; break; fi
+                  # C. 限流 → 跳出本轮做指数退避；被抢/已占用 → 立即试下一个候选
+                  if echo "$ERR" | grep -qiE "RequestLimitExceeded|Throttling|Rate exceeded"; then
+                    echo "API throttled, backing off"; break
+                  fi
+                done
+                [ $EIP_OK -eq 1 ] && break
+                # C. 指数退避(上限 30s)+ 随机抖动
+                sleep $((BACKOFF + RANDOM % 5)); BACKOFF=$((BACKOFF*2)); [ $BACKOFF -gt 20 ] && BACKOFF=20
+              done
+              if [ $EIP_OK -ne 1 ]; then
+                echo "FATAL: no free EIP in pool tag:${EipPoolTagKey}=${EipPoolTagValue} after $MAX_ROUNDS rounds" >&2
+                /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource AgentASG --region ${AWS::Region}
+                exit 1
+              fi
+            fi
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource AgentLaunchTemplate --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AgentASG --region ${AWS::Region}
+
+  AgentASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref InstanceCount
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 10
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - ScheduledActions
+    Properties:
+      VPCZoneIdentifier: !Ref WorkerSubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AgentLaunchTemplate
+        Version: !GetAtt AgentLaunchTemplate.LatestVersionNumber
+      MinSize: '0'
+      MaxSize: '449'
+      DesiredCapacity: !Ref InstanceCount
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics:
+            - GroupInServiceInstances
+            - GroupDesiredCapacity
+            - GroupTotalInstances
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag, PropagateAtLaunch: true }
+        - { Key: Stack, Value: !Ref 'AWS::StackName', PropagateAtLaunch: true }
+        - { Key: Cluster, Value: !Ref AWS::StackName, PropagateAtLaunch: true }
+        - { Key: Component, Value: compute, PropagateAtLaunch: true }
+        - { Key: ManagedBy, Value: cloudformation, PropagateAtLaunch: true }
+
+  RatelimitLimitEnabledSsm:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/migration/${AWS::StackName}/ratelimit/limit-enabled'
+      Type: String
+      Value: 'true'
+      Description: 'rate-limit master switch true|false (false=unlimited)'
+  RatelimitAutoEnabledSsm:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/migration/${AWS::StackName}/ratelimit/auto-enabled'
+      Type: String
+      Value: 'true'
+      Description: 'auto-adjust switch true|false (true=AIMD auto; false=manually fixed bwlimit)'
+  RatelimitTargetGbpsSsm:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/migration/${AWS::StackName}/ratelimit/target-gbps'
+      Type: String
+      Value: !Ref RatelimitTargetGbps
+      Description: 'fleet-wide throughput redline in Gbps (the AIMD target in auto mode)'
+  RatelimitBwlimitSsm:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/migration/${AWS::StackName}/ratelimit/bwlimit'
+      Type: String
+      Value: 'off'
+      Description: 'current per-process bwlimit (bytes/sec or off); overwritten by the controller in auto mode'
+  RatelimitTpsTargetSsm:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/migration/${AWS::StackName}/ratelimit/tpslimit-target'
+      Type: String
+      Value: !Ref RatelimitTpsTarget
+      Description: 'FLEET-WIDE total transactions/sec target (or off). Initial value from the RatelimitTpsTarget stack parameter; can be changed live via SSM afterward. GO-CLUSTER (rcd) mode: the controller Lambda divides this by the live INSTANCE count (each EC2 runs one rcd daemon with a global tpslimit, not per-rclone-process) every 60s and writes the per-EC2 value to ratelimit/tpslimit, which go-worker applies via the rcd options/set API. Default 10000 = loose cap (large files never hit it; guards small-file QPS against GCS ~5000/s read / S3 ~3500/s-per-prefix PUT limits).'
+  RatelimitTpslimitSsm:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/migration/${AWS::StackName}/ratelimit/tpslimit'
+      Type: String
+      Value: 'off'
+      Description: 'per-process rclone --tpslimit (transactions/sec or off); COMPUTED by the controller Lambda each 60s = tpslimit-target / process-count. Workers re-read every 30s. Do not edit by hand — set ratelimit/tpslimit-target instead.'
+
+  # ─────────────── 限速控制平面（本栈单集群的 AIMD 控制器）───────────────
+  # 一个 Lambda + 一个 EventBridge rule，每分钟循环处理 4 个集群（配置经 CLUSTERS env 注入）。
+  # 取代了原先「每集群一个 Lambda（代码逐字复制 4 份且是 ratelimit.py 的劣化分叉）」。
+  # 控制律（AIMD + rcd 模式每-EC2 分摊）即 lambda/ratelimit_controller.py 里的纯函数，
+  # 部署=被测代码，无分叉。
+  RatelimitControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ratelimit-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ratelimit-control
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # 读写本栈集群的限速 SSM 命名空间。
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/migration/*/ratelimit/*'
+              - Effect: Allow
+                Action: [cloudwatch:GetMetricData, cloudwatch:GetMetricStatistics]
+                Resource: '*'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Component, Value: iam }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  RatelimitControllerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ratelimit-controller'
+      Runtime: python3.12
+      # 部署包 = lambda/ratelimit_controller.py(打 zip 传 S3，默认 LambdaS3Key 指向客户已上传的
+      # go 集群专用包 ops/ratelimit-controller-goworker.zip；打包命令见 README)。
+      Handler: ratelimit_controller.handler
+      Timeout: 120
+      Role: !GetAtt RatelimitControllerRole.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: Stack, Value: !Ref 'AWS::StackName' }
+        - { Key: Component, Value: monitoring }
+        - { Key: ManagedBy, Value: cloudformation }
+      Environment:
+        Variables:
+          # 本栈 = 单集群。CLUSTERS 是单元素列表(name=栈名,用于拼 SSM 路径 /migration/<name>/ratelimit/*)。
+          # worker_count=0 = go-worker rcd 模式哨兵:限速除到每 EC2(rcd 全局),非每 rclone 进程。
+          CLUSTERS: !Sub |
+            [{"name":"${AWS::StackName}","asg":"${AgentASG}","threads":${WorkerThreads},"worker_count":0}]
+          SLOW_WINDOW_SEC: '300'
+          FAST_WINDOW_SEC: '60'
+          EMF_NAMESPACE: 'GcsS3Migration'
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Ref LambdaS3Key
+
+  RatelimitSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-ratelimit-60s'
+      ScheduleExpression: 'rate(1 minute)'
+      State: ENABLED
+      Targets:
+        - Id: ratelimit
+          Arn: !GetAtt RatelimitControllerFunction.Arn
+  RatelimitSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RatelimitControllerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RatelimitSchedule.Arn
+
+  # ─────────────────────────── Dashboard (this stack's single cluster) ───────────────────────────
+  MigrationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
+              "properties": { "markdown": "# ${AWS::StackName} - cluster dashboard - monitoring only, no alarms" }
+            },
+            {
+              "type": "metric", "x": 0, "y": 1, "width": 12, "height": 6,
+              "properties": {
+                "title": "Throughput (Gbps): NetworkIn=GCS download / NetworkOut=S3 upload",
+                "region": "${AWS::Region}",
+                "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ "AWS/EC2", "NetworkIn", "AutoScalingGroupName", "${AgentASG}", { "stat": "Sum", "period": 60, "id": "ni", "visible": false } ],
+                  [ "AWS/EC2", "NetworkOut", "AutoScalingGroupName", "${AgentASG}", { "stat": "Sum", "period": 60, "id": "no", "visible": false } ],
+                  [ { "expression": "ni/60*8/1e9", "label": "NetworkIn Gbps" } ],
+                  [ { "expression": "no/60*8/1e9", "label": "NetworkOut Gbps" } ]
+                ],
+                "yAxis": { "left": { "label": "Gbps", "showUnits": false } },
+                "period": 60
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 1, "width": 12, "height": 6,
+              "properties": {
+                "title": "Queue backlog / in-flight (SQS cap 120k/queue)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${MigrationQueue.QueueName}", { "label": "Pending", "stat": "Maximum" } ],
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesNotVisible", "QueueName", "${MigrationQueue.QueueName}", { "label": "In-flight", "stat": "Maximum" } ]
+                ],
+                "annotations": { "horizontal": [ { "label": "single-queue cap 115k", "value": 115000, "color": "#d62728" } ] },
+                "period": 60
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 7, "width": 8, "height": 6,
+              "properties": {
+                "title": "DLQ depth",
+                "region": "${AWS::Region}",
+                "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${MigrationDLQ.QueueName}", { "label": "DLQ", "stat": "Maximum", "color": "#d62728" } ]
+                ],
+                "period": 60
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 7, "width": 8, "height": 6,
+              "properties": {
+                "title": "ASG instances",
+                "region": "${AWS::Region}",
+                "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ "AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${AgentASG}", { "label": "InService", "stat": "Average" } ],
+                  [ "AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", "${AgentASG}", { "label": "Desired", "stat": "Average" } ]
+                ],
+                "period": 60
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 7, "width": 8, "height": 6,
+              "properties": {
+                "title": "Worker CPU / memory % (ASG avg)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries", "stacked": false,
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${AgentASG}", { "label": "CPU %", "stat": "Average" } ],
+                  [ "CWAgent", "mem_used_percent", "AutoScalingGroupName", "${AgentASG}", { "label": "mem %", "stat": "Average" } ]
+                ],
+                "yAxis": { "left": { "min": 0, "max": 100 } },
+                "period": 60
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 13, "width": 12, "height": 6,
+              "properties": {
+                "title": "Four-state attempts/min by State (EMF AttemptCount)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries", "stacked": true,
+                "metrics": [
+                  [ { "expression": "SEARCH('{GcsS3Migration,State} MetricName=\"AttemptCount\"', 'Sum', 60)", "id": "st1", "region": "${AWS::Region}" } ]
+                ],
+                "period": 60
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 13, "width": 12, "height": 6,
+              "properties": {
+                "title": "Source throttle signal: RETRYABLE by ErrorClass (src_rate_limit = GCS 429)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries", "stacked": true,
+                "metrics": [
+                  [ { "expression": "SEARCH('{GcsS3Migration,ErrorClass,State} State=\"RETRYABLE\" MetricName=\"AttemptCount\"', 'Sum', 60)", "id": "rc1", "region": "${AWS::Region}" } ]
+                ],
+                "period": 60
+              }
+            }
+          ]
+        }
+
+Outputs:
+  VpcId:
+    Description: VPC used for deployment.
+    Value: !Ref VpcId
+  WorkerSubnets:
+    Value: !Join [',', !Ref WorkerSubnetIds]
+  TransferStatusTable: { Value: !Ref TransferStatusTable }
+  HeartbeatTable: { Value: !Ref HeartbeatTable }
+  WorkerLogGroup:
+    Description: Shared EMF metrics log group (CloudWatch auto-extracts the GcsS3Migration namespace).
+    Value: !Ref WorkerLogGroup
+  DashboardUrl:
+    Description: Single CloudWatch dashboard for all 4 clusters.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-dashboard'
+
+  # ── this cluster ──
+  QueueUrl: { Value: !Ref MigrationQueue }
+  WorkerSecurityGroupId:
+    Description: worker SG; allow inbound 443 from it on the Interface Endpoint SGs.
+    Value: !GetAtt AgentSecurityGroup.GroupId
+  AgentASGName: { Value: !Ref AgentASG }
+  RatelimitNamespace:
+    Value: !Sub '/migration/${AWS::StackName}/ratelimit/'
+
+  TargetBucketLifecycleReminder:
+    Description: >
+      Required after deployment: destination buckets are external buckets (matched by each cluster's
+      TargetBucketPrefix), and CFN cannot configure their lifecycle. Manually add an
+      AbortIncompleteMultipartUpload(DaysAfterInitiation=1) rule to each bucket actually written to.
+    Value: 'aws s3api put-bucket-lifecycle-configuration --bucket <bucket> --lifecycle-configuration {"Rules":[{"ID":"abort-incomplete-mpu","Status":"Enabled","Filter":{"Prefix":""},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}'

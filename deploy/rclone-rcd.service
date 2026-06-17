@@ -1,0 +1,38 @@
+[Unit]
+Description=rclone rcd daemon (shared transfer engine for go-worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# rcd 常驻：所有传输走 operations/copyfile，连接池在进程生命周期内复用
+# （实测 30 次拷贝仅 1 条到 S3 的 TLS 连接，消灭每文件 fork+握手开销）。
+# 全套 rclone flag 在此一次性给全（per-call 仅用 _config 覆盖 bwlimit/tpslimit）。
+# RCD_USER/RCD_PASS 由 EnvironmentFile 注入（即便本机也必须鉴权——访问 remote 的
+# rc 方法默认要求 auth）。RCLONE_BIN/RCLONE_CONFIG 与 go-worker 共享同一份。
+# ⚠️ --rc-job-expire-duration 必须短（1m）：rclone 把每个 rc 调用都登记为 job 并留内存到
+# expire（同步调用也算）。设长（曾误设 13h）会让高吞吐下几十万已完成 job 常驻内存 →
+# 持续涨到 OOM（即便当前无传输/队列空内存仍涨——客户机实测 8min 涨 14GB）。同步模式下
+# worker 拿到结果即不再查 job，无需长保留。
+EnvironmentFile=/etc/go-worker/env
+ExecStart=/usr/local/bin/rclone rcd \
+  --rc-addr 127.0.0.1:5572 \
+  --rc-user ${RCD_USER} --rc-pass ${RCD_PASS} \
+  --config ${RCLONE_CONFIG} \
+  --rc-job-expire-duration 1m \
+  --transfers ${RCLONE_TRANSFERS} \
+  --s3-upload-cutoff 100M --s3-chunk-size 64M --s3-upload-concurrency 8 \
+  --buffer-size 32M --max-buffer-memory 2G --use-mmap \
+  --header-upload "x-amz-checksum-algorithm: CRC32C" \
+  --header-upload "x-amz-checksum-type: FULL_OBJECT" \
+  --s3-no-check-bucket --s3-disable-checksum --s3-no-head \
+  --metadata --s3-encoding Slash,InvalidUtf8 \
+  --retries 3 --low-level-retries 10 --no-traverse \
+  --use-json-log --log-level INFO
+Restart=always
+RestartSec=5
+# rcd 崩 → 在途 job 全失败重投（only SUCCESS deletes 保证不丢）。
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
