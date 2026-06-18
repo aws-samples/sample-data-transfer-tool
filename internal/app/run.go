@@ -33,7 +33,9 @@ func Run(ctx context.Context, cfg Config) error {
 	ssmClient := ssm.NewFromConfig(awsCfg)
 
 	// rcd 客户端 + 就绪探测（最多等 30s，rcd 由 systemd 先拉起）。
-	rcdClient := rcd.New(cfg.RCDAddr, cfg.RCDUser, cfg.RCDPass)
+	// 连接池上限 = Workers + Receivers + 余量：所有 goroutine 打同一 localhost host，
+	// 池太小（默认 2）会让 stats 等短调用连接反复重建。
+	rcdClient := rcd.New(cfg.RCDAddr, cfg.RCDUser, cfg.RCDPass, cfg.Workers+cfg.Receivers+4)
 	if err := waitRCDReady(ctx, rcdClient, 30*time.Second); err != nil {
 		return fmt.Errorf("rcd 未就绪: %w", err)
 	}

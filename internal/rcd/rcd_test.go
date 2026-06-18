@@ -24,7 +24,7 @@ func newFakeRCD(t *testing.T, handler func(path string, body map[string]any) (in
 }
 
 func clientFor(srv *httptest.Server) *Client {
-	return NewWithBaseURL(srv.URL, "u", "pw")
+	return NewWithBaseURL(srv.URL, "u", "pw", 16)
 }
 
 func TestCopyFile_SyncSuccess(t *testing.T) {

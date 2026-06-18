@@ -516,6 +516,12 @@ Resources:
                   printf 'RCD_PASS=%s\n' "$RCD_PASS" > /etc/migration-rcd-pass
                   chmod 600 /etc/migration-rcd-pass
 
+                  # rcd 内存软上限：按本机 MemTotal 的 85% 算 GOMEMLIMIT（随机型自适应，不硬编码）。
+                  # Go runtime 逼近此值时激进 GC 而非被 OOMKill。单位用 KiB（MemTotal 单位即 kB）。
+                  RCD_MEM_KIB=$(awk '/MemTotal/{print int($2*0.85)}' /proc/meminfo)
+                  printf 'GOMEMLIMIT=%sKiB\n' "$RCD_MEM_KIB" > /etc/rclone-rcd-mem.env
+                  chmod 644 /etc/rclone-rcd-mem.env
+
                   # ① rclone rcd 守护进程：所有传输走 operations/copyfile，连接池复用（消灭每文件 fork+握手）。
                   # 全套 rclone flag 在此一次给全；per-call 仅用 _config 覆盖 bwlimit/tpslimit。
                   # 口令经 EnvironmentFile 注入，ExecStart 用 ${!RCD_PASS}（systemd 运行时展开）。
@@ -532,6 +538,15 @@ Resources:
                   Type=simple
                   User=root
                   EnvironmentFile=/etc/migration-rcd-pass
+                  # 内存兜底（rcd 是 Go 程序）：GOMEMLIMIT 软上限让 runtime 逼近时激进 GC 而非
+                  # 被 OOMKill；按机器内存 85% 由 cfn-init 写入 /etc/rclone-rcd-mem.env（随机型自适应，
+                  # 不硬编码字节）。GOGC=50 让稳态 GC 更勤、压低峰值堆。cgroup MemoryHigh/Max 用百分比
+                  # 作第二道闸（MemoryHigh 软节流、MemoryMax 硬顶）。注：stats group 泄漏已在代码层根治
+                  # （runner 固定 group 池），此处是防其他内存尖峰的纵深防御。
+                  EnvironmentFile=/etc/rclone-rcd-mem.env
+                  Environment="GOGC=50"
+                  MemoryHigh=85%
+                  MemoryMax=92%
                   ExecStart=${RcloneBinPath} rcd --rc-addr 127.0.0.1:5572 \\
                     --rc-user worker --rc-pass \${!RCD_PASS} \\
                     --config /root/.config/rclone/rclone.conf \\
@@ -788,6 +803,10 @@ Resources:
       MinSize: '0'
       MaxSize: '449'
       DesiredCapacity: !Ref InstanceCount
+      # 健康检查宽限期 900s：经 CFN/SDK 创建时该值默认 0（非 console 的 300），
+      # 而 cfn-init 启动 rclone-rcd+go-worker 约需十几分钟。设 900 覆盖启动窗口，
+      # 否则实例一进 InService 就被健康检查盯上、启动未完成即被误判替换。
+      HealthCheckGracePeriod: 900
       MetricsCollection:
         - Granularity: 1Minute
           Metrics:

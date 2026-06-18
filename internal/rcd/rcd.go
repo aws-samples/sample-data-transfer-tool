@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 )
 
 // Client 一个指向本机 rcd 的轻客户端（127.0.0.1:5572 + basic auth）。
@@ -30,20 +31,32 @@ type Client struct {
 	http    *http.Client
 }
 
-// New 构造客户端。addr 形如 "127.0.0.1:5572"。
-func New(addr, user, pass string) *Client {
-	return NewWithBaseURL("http://"+addr, user, pass)
+// New 构造客户端。addr 形如 "127.0.0.1:5572"。maxConns 为预期峰值并发（≈ worker
+// goroutine 数 + 余量），用于设连接池上限——所有 goroutine 都打同一个 host(localhost
+// rcd)，默认 Transport 的 MaxIdleConnsPerHost=2 会让 stats 等短调用的连接用完即弃、
+// 频繁重建 TCP（高 TPS 下还可能耗尽临时端口），与"连接复用消灭握手开销"的设计相悖。
+func New(addr string, user, pass string, maxConns int) *Client {
+	return NewWithBaseURL("http://"+addr, user, pass, maxConns)
 }
 
 // NewWithBaseURL 用完整 baseURL 构造（如 http://127.0.0.1:5572）。供测试注入 test server。
-func NewWithBaseURL(baseURL, user, pass string) *Client {
+func NewWithBaseURL(baseURL, user, pass string, maxConns int) *Client {
+	if maxConns < 2 {
+		maxConns = 2
+	}
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	// 全部并发都连同一个 localhost host，per-host 上限必须 = 峰值并发，否则空闲连接
+	// 被丢弃后短调用反复重建。MaxIdleConns 同步放大。
+	t.MaxIdleConns = maxConns
+	t.MaxIdleConnsPerHost = maxConns
+	t.IdleConnTimeout = 90 * time.Second
 	return &Client{
 		baseURL: baseURL,
 		user:    user,
 		pass:    pass,
 		// 同步传输可能跑数分钟：HTTP client 不设固定 Timeout，由每次调用的 ctx
 		// deadline 控制（= RCLONE_TIMEOUT，≤0.7×visibility，防双写）。
-		http: &http.Client{},
+		http: &http.Client{Transport: t},
 	}
 }
 

@@ -11,19 +11,21 @@ import (
 )
 
 // TransferMessage 一条 SQS 工作项：一个对象 = 一条消息。
+//
+// 注：rcd 模式不支持 per-message rclone 参数。所有 rclone flag 在 rclone-rcd 守护进程
+// 启动时一次性给全（systemd unit 的 ExecStart），限速经 ratelimit 层设 rcd 全局。
+// 消息体只承载 source/destination/op 三个字段（旧 Python 的 rclone_args 已废弃）。
 type TransferMessage struct {
 	Source      string
 	Destination string
 	Op          model.Op
-	RcloneArgs  []string
 }
 
-// rawBody SQS body 的 JSON 形态（op 缺省 copy，rclone_args 可省）。
+// rawBody SQS body 的 JSON 形态（op 缺省 copy）。
 type rawBody struct {
-	Source      string   `json:"source"`
-	Destination string   `json:"destination"`
-	Op          string   `json:"op"`
-	RcloneArgs  []string `json:"rclone_args"`
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+	Op          string `json:"op"`
 }
 
 // Parse 解析消息体。非法（坏 JSON / 缺 destination / 非法 op）→ error，调用方按 poison 处理。
@@ -52,7 +54,6 @@ func Parse(body string) (TransferMessage, error) {
 		Source:      rb.Source,
 		Destination: rb.Destination,
 		Op:          op,
-		RcloneArgs:  rb.RcloneArgs,
 	}, nil
 }
 

@@ -7,7 +7,7 @@
 // 用法：
 //
 //	go run ./tools/feeder -queue <url> -bucket <b> -prefix stress-small/ \
-//	    -dst-prefix smalltest -count 20000 -conc 48 [-repeat 5] [-disable-copy]
+//	    -dst-prefix smalltest -count 20000 -conc 48 [-repeat 5]
 package main
 
 import (
@@ -37,8 +37,7 @@ func main() {
 		count       = flag.Int("count", 10000, "最多灌多少条（单轮）")
 		conc        = flag.Int("conc", 48, "并发 SendMessageBatch 协程数")
 		repeat      = flag.Int("repeat", 1, "重复轮数（每轮目标 prefix 带 -rN 后缀去重）")
-		region      = flag.String("region", "eu-south-2", "AWS region")
-		disableCopy = flag.Bool("disable-copy", false, "加 rclone_args --disable copy 强制走 NIC")
+		region = flag.String("region", "eu-south-2", "AWS region")
 	)
 	flag.Parse()
 	if *queueURL == "" || *bucket == "" {
@@ -80,7 +79,7 @@ func main() {
 	start := time.Now()
 	for r := 0; r < *repeat; r++ {
 		round := r
-		feedRound(ctx, sqsc, *queueURL, *bucket, keys, *dstPrefix, round, *conc, *disableCopy, &sent)
+		feedRound(ctx, sqsc, *queueURL, *bucket, keys, *dstPrefix, round, *conc, &sent)
 		log.Printf("轮 %d/%d 完成，累计已发 %d，用时 %s（%.0f msg/s）",
 			round+1, *repeat, sent.Load(), time.Since(start).Round(time.Second),
 			float64(sent.Load())/time.Since(start).Seconds())
@@ -90,7 +89,7 @@ func main() {
 
 // feedRound 把 keys 切成 10 条一批，并发 SendMessageBatch 灌入队列。
 func feedRound(ctx context.Context, sqsc *sqs.Client, queueURL, bucket string,
-	keys []string, dstPrefix string, round, conc int, disableCopy bool, sent *atomic.Int64) {
+	keys []string, dstPrefix string, round, conc int, sent *atomic.Int64) {
 
 	type batch []string
 	ch := make(chan batch, conc*2)
@@ -108,7 +107,7 @@ func feedRound(ctx context.Context, sqsc *sqs.Client, queueURL, bucket string,
 						rel = k[idx+1:] // 去掉源前缀首段，避免目标 key 套娃
 					}
 					dst := fmt.Sprintf("%s/r%d/%s", dstPrefix, round, rel)
-					body := buildBody(bucket, k, dst, disableCopy)
+					body := buildBody(bucket, k, dst)
 					entries = append(entries, types.SendMessageBatchRequestEntry{
 						Id:          aws.String(strconv.Itoa(j)),
 						MessageBody: aws.String(body),
@@ -139,16 +138,13 @@ func feedRound(ctx context.Context, sqsc *sqs.Client, queueURL, bucket string,
 }
 
 // buildBody 组装一条迁移消息体（与 worker message.TransferMessage 契约一致）。
-func buildBody(bucket, srcKey, dstKey string, disableCopy bool) string {
+// rcd 模式不支持 per-message rclone 参数，消息体只含 source/destination（op 默认 copy）。
+func buildBody(bucket, srcKey, dstKey string) string {
 	var sb strings.Builder
 	sb.WriteString(`{"source":"s3:`)
 	sb.WriteString(bucket + "/" + srcKey)
 	sb.WriteString(`","destination":"s3:`)
 	sb.WriteString(bucket + "/" + dstKey)
-	sb.WriteString(`"`)
-	if disableCopy {
-		sb.WriteString(`,"rclone_args":["--disable","copy"]`)
-	}
-	sb.WriteString(`}`)
+	sb.WriteString(`"}`)
 	return sb.String()
 }

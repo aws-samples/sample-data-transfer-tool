@@ -79,7 +79,7 @@ func newFakeRCDServer(t *testing.T) *fakeRCDServer {
 }
 
 func (f *fakeRCDServer) runner(timeout time.Duration) *Runner {
-	return NewRunner(rcd.NewWithBaseURL(f.srv.URL, "u", "p"), RunnerConfig{Timeout: timeout})
+	return NewRunner(rcd.NewWithBaseURL(f.srv.URL, "u", "p", 16), RunnerConfig{Timeout: timeout})
 }
 
 var copyMsg = message.TransferMessage{Source: "s3:b/k", Destination: "s3:b/k2", Op: model.OpCopy}
