@@ -7,14 +7,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 # go-worker 启动时探 rc/noop 就绪才消费（rcd 先起）。单进程多 goroutine：
-# WORKER_GOROUTINES 个 worker + RECEIVER_GOROUTINES 个 receiver，channel 背压。
-# ⚠️ WORKER_GOROUTINES 应 ≈ rcd 的 --transfers（RCLONE_TRANSFERS），否则提交多于
-# 执行会在 rcd 内排队、撞轮询 deadline 被误 job/stop。
+# WORKER_GOROUTINES 个 worker + RECEIVER_GOROUTINES 个 receiver，SQS in-flight 受 worker slots 限制。
+# ⚠️ WORKER_GOROUTINES 必须等于 rcd 的 --transfers（RCLONE_TRANSFERS），否则提交多于
+# 执行会在 rcd 内排队，破坏 timeout/visibility 语义。
 EnvironmentFile=/etc/go-worker/env
 ExecStart=/usr/local/bin/go-worker
 Restart=always
 RestartSec=5
-# SIGTERM → 优雅 drain：停拉取 + 在途 job/stop + 在途消息 visibility=0 重投。
+# SIGTERM → 优雅 drain：停拉取 + HTTP ctx 取消中止在途传输 + 在途消息 visibility=0 重投。
 KillSignal=SIGTERM
 TimeoutStopSec=60
 

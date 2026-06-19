@@ -9,8 +9,11 @@ import (
 	"github.com/aws-samples/sample-data-transfer-tool/internal/classify"
 	"github.com/aws-samples/sample-data-transfer-tool/internal/message"
 	"github.com/aws-samples/sample-data-transfer-tool/internal/model"
+	"github.com/aws-samples/sample-data-transfer-tool/internal/obslog"
 	"github.com/aws-samples/sample-data-transfer-tool/internal/rcd"
 )
+
+const rcdStatsTimeout = 5 * time.Second
 
 // RunnerConfig runner 行为参数。
 type RunnerConfig struct {
@@ -50,7 +53,7 @@ func NewRunner(client *rcd.Client, cfg RunnerConfig) *Runner {
 
 // borrowGroup 从池借一个 group（阻塞直到有空闲），releaseGroup 归还。借出期间该 group
 // 由当前 goroutine 独占 → 可用「传输前后 group 累计字节之差」精确归因本次传输字节。
-func (r *Runner) borrowGroup() string  { return <-r.groups }
+func (r *Runner) borrowGroup() string   { return <-r.groups }
 func (r *Runner) releaseGroup(g string) { r.groups <- g }
 
 // RunCopy 同步执行 copyfile/deletefile，阻塞到完成，返回四态。
@@ -73,7 +76,27 @@ func (r *Runner) RunCopy(ctx context.Context, msg message.TransferMessage) model
 	// 传输前 reset 该 group 计数（独占借出，安全）：传后读 bytes 即本次传输字节，
 	// 无累计、无溢出、不受 rcd 重启基准失效影响。reset 只清计数不删 StatsInfo，不泄漏。
 	if msg.Op == model.OpCopy || msg.Op == model.OpRefresh {
-		_ = r.client.ResetStatsGroup(context.Background(), group)
+		resetCtx, resetCancel := context.WithTimeout(tctx, rcdStatsTimeout)
+		err := r.client.ResetStatsGroup(resetCtx, group)
+		resetCancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return model.RunResult{
+					State: model.StateUnknown, ExitCode: -1,
+					ErrorClass: "worker_shutdown", ErrorMessage: "worker 停机，stats reset 未完成", CmdStr: cmdStr,
+				}
+			}
+			if tctx.Err() == context.DeadlineExceeded {
+				return model.RunResult{
+					State: model.StateUnknown, ExitCode: -1,
+					ErrorClass: "rclone_timeout", ErrorMessage: "传输超时预算内 stats reset 未完成", CmdStr: cmdStr,
+				}
+			}
+			return model.RunResult{
+				State: model.StateRetryable, ExitCode: 1,
+				ErrorClass: "rcd_stats_reset", ErrorMessage: err.Error(), CmdStr: cmdStr,
+			}
+		}
 	}
 
 	start := r.now()
@@ -84,12 +107,16 @@ func (r *Runner) RunCopy(ctx context.Context, msg message.TransferMessage) model
 		// 同步成功。group 传输前已清零，当前 bytes 即本次传输字节。
 		stats := model.TransferStats{ElapsedSeconds: elapsed}
 		if msg.Op == model.OpCopy || msg.Op == model.OpRefresh {
-			if gs, e := r.client.StatsByGroup(context.Background(), group); e == nil {
+			statsCtx, statsCancel := context.WithTimeout(context.WithoutCancel(ctx), rcdStatsTimeout)
+			if gs, e := r.client.StatsByGroup(statsCtx, group); e == nil {
 				stats.Bytes = gs.Bytes
 				if stats.ElapsedSeconds > 0 {
 					stats.Speed = float64(stats.Bytes) / stats.ElapsedSeconds
 				}
+			} else {
+				obslog.Warnf("读取 rcd stats 失败 group=%s err=%v", group, e)
 			}
+			statsCancel()
 		}
 		return model.RunResult{
 			State: model.StateSuccess, ExitCode: 0, CmdStr: cmdStr, Stats: stats,

@@ -31,22 +31,23 @@ type Stats struct {
 	Fatal       atomic.Int64
 	Unknown     atomic.Int64
 	Poison      atomic.Int64 // poison 单独计（不再混进 Unknown）
+	RecordFail  atomic.Int64
 	DeleteFail  atomic.Int64
 	RequeueFail atomic.Int64
 }
 
 // ConsumerConfig 消费循环参数。回答"怎么控制并发"：
 //   - Receivers: 拉 SQS 的 goroutine 数（少数即可，2-4）
-//   - Workers:   处理(提交+轮询)的 goroutine 数 N —— 必须 ≈ rcd --transfers，
-//     否则提交多于执行会在 rcd 内排队、撞轮询 deadline 被误 stop。
+//   - Workers:   处理(提交+等待同步 HTTP)的 goroutine 数 N —— 必须 = rcd --transfers，
+//     否则提交多于执行会在 rcd 内排队，破坏 timeout/visibility 语义。
 type ConsumerConfig struct {
 	QueueURL  string
 	Receivers int
 	Workers   int
 }
 
-// Consumer 竞争消费者：Receivers 个 goroutine 批量拉 SQS → channel → Workers 个处理。
-// channel 满则 receiver 阻塞 = 天然背压，不会拉过头超出 in-flight。
+// Consumer 竞争消费者：Receivers 个 goroutine 按 worker slots 拉 SQS → Workers 个处理。
+// slots 是唯一 in-flight 闸门，不会拉过头超出本机处理能力。
 type Consumer struct {
 	sqs        SQSAPI
 	cfg        ConsumerConfig
@@ -56,9 +57,23 @@ type Consumer struct {
 	report     func(EMFEvent)
 	stats      *Stats
 
-	inflight sync.Map     // receipt -> struct{}，停机时批量重置 visibility=0
-	progress atomic.Int64 // receiver 每轮 ReceiveMessage（含空 long-poll）+1，watchdog 判活
+	inflight      sync.Map     // receipt -> struct{}，停机时批量重置 visibility=0
+	inflightCount atomic.Int64 // 已从 SQS 收到且尚未完成 delete/requeue 的消息数
+	active        atomic.Int64 // 正在 worker goroutine 内处理的消息数
+	progress      atomic.Int64 // receiver/liveness 推进计数，watchdog 判活
 }
+
+type queuedMessage struct {
+	msg     sqstypes.Message
+	receipt string
+}
+
+const (
+	maxReceiveBatch       = 10
+	sqsSideEffectTimeout  = 10 * time.Second
+	watchdogProgressEvery = 15 * time.Second
+	maxVisibilitySeconds  = 43200
+)
 
 // Progress 返回 receiver 循环推进计数。空闲（长轮询空返）也推进，故只有真卡死才不增，
 // watchdog 据此区分"空闲"与"僵死"，避免误杀空闲机。
@@ -69,7 +84,7 @@ type Recorder interface {
 	RecordTerminal(ctx context.Context, source, attemptTS string, result model.RunResult, instanceID, nowISO, body string) error
 }
 
-// NewConsumer 构造消费者。runCopy 提交并轮询一次传输返回四态（通常是 Runner.RunCopy，
+// NewConsumer 构造消费者。runCopy 同步执行一次传输返回四态（通常是 Runner.RunCopy，
 // 测试可注入 fake）。
 func NewConsumer(sqsClient SQSAPI, cfg ConsumerConfig, instanceID string,
 	runCopy func(context.Context, message.TransferMessage) model.RunResult,
@@ -88,8 +103,13 @@ func NewConsumer(sqsClient SQSAPI, cfg ConsumerConfig, instanceID string,
 
 // Run 启动 receiver + worker goroutine，阻塞到 ctx 取消后优雅 drain。
 func (c *Consumer) Run(ctx context.Context) {
-	// buffer ≈ workers，背压：满则 receiver 阻塞。
-	jobCh := make(chan sqstypes.Message, c.cfg.Workers)
+	// jobCh 不缓冲；slots 才是唯一 in-flight 闸门。这样"已从 SQS 收到但未完成
+	// delete/requeue"的消息数严格 ≤ Workers，避免本地预取时间吃掉 visibility 安全裕量。
+	jobCh := make(chan queuedMessage)
+	slots := make(chan struct{}, c.cfg.Workers)
+	for i := 0; i < c.cfg.Workers; i++ {
+		slots <- struct{}{}
+	}
 
 	var workerWG sync.WaitGroup
 	for i := 0; i < c.cfg.Workers; i++ {
@@ -97,7 +117,10 @@ func (c *Consumer) Run(ctx context.Context) {
 		go func() {
 			defer workerWG.Done()
 			for m := range jobCh {
-				c.handle(ctx, m)
+				func() {
+					defer c.releaseSlots(slots, 1)
+					c.handle(ctx, m)
+				}()
 			}
 		}()
 	}
@@ -107,9 +130,10 @@ func (c *Consumer) Run(ctx context.Context) {
 		recvWG.Add(1)
 		go func() {
 			defer recvWG.Done()
-			c.receiveLoop(ctx, jobCh)
+			c.receiveLoop(ctx, jobCh, slots)
 		}()
 	}
+	go c.livenessLoop(ctx)
 
 	recvWG.Wait() // ctx 取消后 receiver 退出
 	close(jobCh)  // 不再有新消息
@@ -118,23 +142,28 @@ func (c *Consumer) Run(ctx context.Context) {
 }
 
 // receiveLoop 一个 receiver：long-poll 批量拉，逐条塞入 jobCh（满则阻塞=背压）。
-func (c *Consumer) receiveLoop(ctx context.Context, jobCh chan<- sqstypes.Message) {
+func (c *Consumer) receiveLoop(ctx context.Context, jobCh chan<- queuedMessage, slots chan struct{}) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
+		taken, ok := c.acquireSlots(ctx, slots, maxReceiveBatch)
+		if !ok {
+			return
+		}
 		// 每轮推进进展（含下面的空 long-poll / 错误重试）——watchdog 据此判活，
 		// 空闲也算"在转"，只有 ReceiveMessage 整个卡死才不推进。
 		c.progress.Add(1)
 		out, err := c.sqs.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:              aws.String(c.cfg.QueueURL),
-			MaxNumberOfMessages:   10,
+			MaxNumberOfMessages:   safeReceiveBatch(taken),
 			WaitTimeSeconds:       20, // long-poll
 			MessageAttributeNames: []string{"object_size"},
 		})
 		if err != nil {
+			c.releaseSlots(slots, taken)
 			if ctx.Err() != nil {
 				return
 			}
@@ -142,21 +171,94 @@ func (c *Consumer) receiveLoop(ctx context.Context, jobCh chan<- sqstypes.Messag
 			time.Sleep(time.Second)
 			continue
 		}
+		if unused := taken - len(out.Messages); unused > 0 {
+			c.releaseSlots(slots, unused)
+		}
 		for _, m := range out.Messages {
+			receipt := aws.ToString(m.ReceiptHandle)
+			c.registerInflight(receipt)
 			select {
 			case <-ctx.Done():
+				c.resetOneVisibility(receipt)
+				c.finishInflight(receipt)
+				c.releaseSlots(slots, 1)
 				return
-			case jobCh <- m:
+			case jobCh <- queuedMessage{msg: m, receipt: receipt}:
+			}
+		}
+	}
+}
+
+func (c *Consumer) acquireSlots(ctx context.Context, slots <-chan struct{}, max int) (int, bool) {
+	if max > c.cfg.Workers {
+		max = c.cfg.Workers
+	}
+	select {
+	case <-ctx.Done():
+		return 0, false
+	case <-slots:
+	}
+	n := 1
+	for n < max {
+		select {
+		case <-slots:
+			n++
+		default:
+			return n, true
+		}
+	}
+	return n, true
+}
+
+func safeReceiveBatch(n int) int32 {
+	if n < 1 {
+		return 1
+	}
+	if n > maxReceiveBatch {
+		return maxReceiveBatch
+	}
+	return int32(n) // #nosec G115 -- n is clamped to SQS batch range [1,10].
+}
+
+func (c *Consumer) releaseSlots(slots chan<- struct{}, n int) {
+	for i := 0; i < n; i++ {
+		slots <- struct{}{}
+	}
+}
+
+func (c *Consumer) registerInflight(receipt string) {
+	c.inflight.Store(receipt, struct{}{})
+	c.inflightCount.Add(1)
+}
+
+func (c *Consumer) finishInflight(receipt string) {
+	if _, ok := c.inflight.LoadAndDelete(receipt); ok {
+		c.inflightCount.Add(-1)
+	}
+}
+
+func (c *Consumer) livenessLoop(ctx context.Context) {
+	t := time.NewTicker(watchdogProgressEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if c.active.Load() > 0 || c.inflightCount.Load() > 0 {
+				c.progress.Add(1)
 			}
 		}
 	}
 }
 
 // handle 处理单条消息：登记 in-flight → ProcessMessage(注入副作用) → 移除 in-flight。
-func (c *Consumer) handle(ctx context.Context, m sqstypes.Message) {
-	receipt := aws.ToString(m.ReceiptHandle)
-	c.inflight.Store(receipt, struct{}{})
-	defer c.inflight.Delete(receipt)
+func (c *Consumer) handle(ctx context.Context, qm queuedMessage) {
+	m := qm.msg
+	receipt := qm.receipt
+	c.active.Add(1)
+	defer c.active.Add(-1)
+	defer c.finishInflight(receipt)
 
 	size := parseObjectSize(m)
 	attemptTS := nowAttemptTS()
@@ -166,10 +268,10 @@ func (c *Consumer) handle(ctx context.Context, m sqstypes.Message) {
 		RunCopy: c.runCopy,
 		Delete:  func() error { return c.deleteMsg(ctx, receipt) },
 		Requeue: func(d int) error { return c.requeue(ctx, receipt, d) },
-		Record: func(source, ts string, result model.RunResult, b string) {
+		Record: func(source, ts string, result model.RunResult, b string) error {
 			// ts = attemptTS（开始/SK）；nowAttemptTS() = 终态写入时刻（≈完成）。
 			// 两者分开，DDB 里能看到开始时间 + 完成时间 + 中间的 elapsed。
-			_ = c.store.RecordTerminal(ctx, source, ts, result, c.instanceID, nowAttemptTS(), b)
+			return c.store.RecordTerminal(ctx, source, ts, result, c.instanceID, nowAttemptTS(), b)
 		},
 		Report: c.report,
 	}
@@ -178,22 +280,34 @@ func (c *Consumer) handle(ctx context.Context, m sqstypes.Message) {
 }
 
 func (c *Consumer) deleteMsg(ctx context.Context, receipt string) error {
-	_, err := c.sqs.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+	sideCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sqsSideEffectTimeout)
+	defer cancel()
+	_, err := c.sqs.DeleteMessage(sideCtx, &sqs.DeleteMessageInput{
 		QueueUrl: aws.String(c.cfg.QueueURL), ReceiptHandle: aws.String(receipt),
 	})
 	if err != nil {
 		c.stats.DeleteFail.Add(1)
+		obslog.Errorf("DeleteMessage 失败 receipt=%s err=%v", receipt, err)
 	}
 	return err
 }
 
 func (c *Consumer) requeue(ctx context.Context, receipt string, delay int) error {
-	_, err := c.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+	if delay < 0 {
+		delay = 0
+	}
+	if delay > maxVisibilitySeconds {
+		delay = maxVisibilitySeconds
+	}
+	sideCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sqsSideEffectTimeout)
+	defer cancel()
+	_, err := c.sqs.ChangeMessageVisibility(sideCtx, &sqs.ChangeMessageVisibilityInput{
 		QueueUrl: aws.String(c.cfg.QueueURL), ReceiptHandle: aws.String(receipt),
 		VisibilityTimeout: int32(delay),
 	})
 	if err != nil {
 		c.stats.RequeueFail.Add(1)
+		obslog.Errorf("ChangeMessageVisibility 失败 receipt=%s delay=%d err=%v", receipt, delay, err)
 	}
 	return err
 }
@@ -203,12 +317,31 @@ func (c *Consumer) resetInflightVisibility() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	c.inflight.Range(func(k, _ any) bool {
-		_, _ = c.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+		receipt := k.(string)
+		_, err := c.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
 			QueueUrl: aws.String(c.cfg.QueueURL), ReceiptHandle: aws.String(k.(string)),
 			VisibilityTimeout: 0,
 		})
+		if err != nil {
+			c.stats.RequeueFail.Add(1)
+			obslog.Errorf("停机重置 visibility 失败 receipt=%s err=%v", receipt, err)
+		}
+		c.finishInflight(receipt)
 		return true
 	})
+}
+
+func (c *Consumer) resetOneVisibility(receipt string) {
+	ctx, cancel := context.WithTimeout(context.Background(), sqsSideEffectTimeout)
+	defer cancel()
+	_, err := c.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+		QueueUrl: aws.String(c.cfg.QueueURL), ReceiptHandle: aws.String(receipt),
+		VisibilityTimeout: 0,
+	})
+	if err != nil {
+		c.stats.RequeueFail.Add(1)
+		obslog.Errorf("取消投递前重置 visibility 失败 receipt=%s err=%v", receipt, err)
+	}
 }
 
 // parseObjectSize 从 SQS MessageAttribute object_size 读对象大小（缺省 0=small 维度）。
@@ -226,9 +359,14 @@ func parseObjectSize(m sqstypes.Message) int64 {
 
 func (c *Consumer) tally(o Outcome) {
 	c.stats.Total.Add(1) // 进展信号 + 总处理数（对齐 Python total）
+	if o.RecordFailed {
+		c.stats.RecordFail.Add(1)
+	}
 	switch {
 	case o.Poison:
 		c.stats.Poison.Add(1) // poison 单独计，不混进 unknown
+	case o.RecordFailed:
+		return
 	case !o.Counted:
 		c.stats.Unknown.Add(1)
 	case o.State == model.StateSuccess:

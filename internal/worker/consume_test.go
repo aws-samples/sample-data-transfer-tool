@@ -17,22 +17,30 @@ import (
 
 // fakeSQS 模拟 SQS：首批返回 n 条消息，之后空（long-poll 模拟）。
 type fakeSQS struct {
-	mu        sync.Mutex
-	delivered bool
-	n         int
-	deletes   atomic.Int64
-	visChange atomic.Int64
+	mu           sync.Mutex
+	delivered    bool
+	n            int
+	deletes      atomic.Int64
+	visChange    atomic.Int64
+	maxReceive   atomic.Int64
+	deleteCtxErr error
+	visCtxErr    error
 }
 
-func (f *fakeSQS) ReceiveMessage(_ context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+func (f *fakeSQS) ReceiveMessage(_ context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.maxReceive.Store(int64(in.MaxNumberOfMessages))
 	if f.delivered {
 		time.Sleep(10 * time.Millisecond)
 		return &sqs.ReceiveMessageOutput{}, nil
 	}
 	f.delivered = true
-	msgs := make([]sqstypes.Message, f.n)
+	n := f.n
+	if int32(n) > in.MaxNumberOfMessages {
+		n = int(in.MaxNumberOfMessages)
+	}
+	msgs := make([]sqstypes.Message, n)
 	for i := range msgs {
 		msgs[i] = sqstypes.Message{
 			ReceiptHandle: aws.String("r" + string(rune('0'+i))),
@@ -42,14 +50,70 @@ func (f *fakeSQS) ReceiveMessage(_ context.Context, _ *sqs.ReceiveMessageInput, 
 	return &sqs.ReceiveMessageOutput{Messages: msgs}, nil
 }
 
-func (f *fakeSQS) DeleteMessage(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+func (f *fakeSQS) DeleteMessage(ctx context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+	f.mu.Lock()
+	f.deleteCtxErr = ctx.Err()
+	f.mu.Unlock()
 	f.deletes.Add(1)
 	return &sqs.DeleteMessageOutput{}, nil
 }
 
-func (f *fakeSQS) ChangeMessageVisibility(_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+func (f *fakeSQS) ChangeMessageVisibility(ctx context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+	f.mu.Lock()
+	f.visCtxErr = ctx.Err()
+	f.mu.Unlock()
 	f.visChange.Add(1)
 	return &sqs.ChangeMessageVisibilityOutput{}, nil
+}
+
+func TestConsumer_ReceiveBatchCappedByWorkerSlots(t *testing.T) {
+	fs := &fakeSQS{n: 5}
+	rec := &fakeRecorder{}
+	stats := &Stats{}
+	runCopy := func(_ context.Context, _ message.TransferMessage) model.RunResult {
+		return model.RunResult{State: model.StateSuccess}
+	}
+	c := NewConsumer(fs, ConsumerConfig{QueueURL: "q", Receivers: 1, Workers: 2}, "i#0",
+		runCopy, rec, func(EMFEvent) {}, stats)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.Run(ctx); close(done) }()
+	for i := 0; i < 100 && fs.deletes.Load() < 2; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if fs.maxReceive.Load() > 2 {
+		t.Fatalf("ReceiveMessage batch 应受 worker slots 限制，got %d", fs.maxReceive.Load())
+	}
+	if fs.deletes.Load() != 2 {
+		t.Fatalf("fakeSQS 首批最多应交付 2 条，got deletes=%d", fs.deletes.Load())
+	}
+}
+
+func TestConsumer_SQSSideEffectsIgnoreCanceledParentContext(t *testing.T) {
+	fs := &fakeSQS{}
+	c := NewConsumer(fs, ConsumerConfig{QueueURL: "q", Receivers: 1, Workers: 1}, "i#0",
+		nil, &fakeRecorder{}, func(EMFEvent) {}, &Stats{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := c.deleteMsg(ctx, "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.requeue(ctx, "r1", 1); err != nil {
+		t.Fatal(err)
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.deleteCtxErr != nil {
+		t.Fatalf("DeleteMessage 不应继承父 ctx cancellation，got %v", fs.deleteCtxErr)
+	}
+	if fs.visCtxErr != nil {
+		t.Fatalf("ChangeMessageVisibility 不应继承父 ctx cancellation，got %v", fs.visCtxErr)
+	}
 }
 
 type fakeRecorder struct{ count atomic.Int64 }

@@ -44,6 +44,7 @@ func build(ev worker.EMFEvent, tsMillis int64) (map[string]any, error) {
 	for i, n := range dimensionNames {
 		dims[i] = []string{n}
 	}
+	dims = append(dims, []string{"State", "ErrorClass"})
 	fileCount := 0
 	if ev.State == "SUCCESS" {
 		fileCount = 1

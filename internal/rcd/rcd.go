@@ -23,6 +23,8 @@ import (
 	"time"
 )
 
+const maxResponseBodyBytes = 1 << 20
+
 // Client 一个指向本机 rcd 的轻客户端（127.0.0.1:5572 + basic auth）。
 type Client struct {
 	baseURL string
@@ -49,6 +51,7 @@ func NewWithBaseURL(baseURL, user, pass string, maxConns int) *Client {
 	// 被丢弃后短调用反复重建。MaxIdleConns 同步放大。
 	t.MaxIdleConns = maxConns
 	t.MaxIdleConnsPerHost = maxConns
+	t.MaxConnsPerHost = maxConns
 	t.IdleConnTimeout = 90 * time.Second
 	return &Client{
 		baseURL: baseURL,
@@ -149,21 +152,41 @@ func (c *Client) post(ctx context.Context, path string, payload any, out any) er
 		return fmt.Errorf("调用 %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, truncated, readErr := readLimited(resp.Body, maxResponseBodyBytes)
+	if readErr != nil {
+		return fmt.Errorf("读取 %s 响应: %w", path, readErr)
+	}
 	if resp.StatusCode != http.StatusOK {
 		// rc 业务失败：优先回传 rcd 的 error 文本（供四态分类）。
 		var re rcError
 		if json.Unmarshal(body, &re) == nil && re.Error != "" {
 			return fmt.Errorf("%s", re.Error)
 		}
+		if truncated {
+			return fmt.Errorf("rc %s 返回 %d: %s...(truncated)", path, resp.StatusCode, truncate(body, 512))
+		}
 		return fmt.Errorf("rc %s 返回 %d: %s", path, resp.StatusCode, truncate(body, 512))
 	}
 	if out != nil {
+		if truncated {
+			return fmt.Errorf("rc %s 响应超过 %d bytes", path, maxResponseBodyBytes)
+		}
 		if err := json.Unmarshal(body, out); err != nil {
 			return fmt.Errorf("解析 %s 响应: %w", path, err)
 		}
 	}
 	return nil
+}
+
+func readLimited(r io.Reader, max int64) ([]byte, bool, error) {
+	body, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(body)) > max {
+		return body[:max], true, nil
+	}
+	return body, false, nil
 }
 
 func truncate(b []byte, n int) string {

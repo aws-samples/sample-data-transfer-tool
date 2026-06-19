@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 # rcd 常驻：所有传输走 operations/copyfile，连接池在进程生命周期内复用
 # （实测 30 次拷贝仅 1 条到 S3 的 TLS 连接，消灭每文件 fork+握手开销）。
-# 全套 rclone flag 在此一次性给全（per-call 仅用 _config 覆盖 bwlimit/tpslimit）。
+# 全套 rclone flag 在此一次性给全；限速由 go-worker 调 rcd 全局端点生效。
 # RCD_USER/RCD_PASS 由 EnvironmentFile 注入（即便本机也必须鉴权——访问 remote 的
 # rc 方法默认要求 auth）。RCLONE_BIN/RCLONE_CONFIG 与 go-worker 共享同一份。
 # ⚠️ --rc-job-expire-duration 必须短（1m）：rclone 把每个 rc 调用都登记为 job 并留内存到

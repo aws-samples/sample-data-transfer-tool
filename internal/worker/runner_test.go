@@ -19,8 +19,11 @@ type fakeRCDServer struct {
 	mu          sync.Mutex
 	delay       time.Duration // copyfile 阻塞时长（模拟传输耗时）
 	errBody     string        // 非空 = 业务失败，返回该 error
-	gotIgnoreTm bool          // 捕获最近 copyfile 是否带 _config.IgnoreTimes
-	groupBytes  int64         // 模拟 group 累计字节（copyfile 成功后 +12345，差值=本次）
+	resetErr    string
+	statsErr    string
+	gotIgnoreTm bool // 捕获最近 copyfile 是否带 _config.IgnoreTimes
+	copyCalled  bool
+	groupBytes  int64 // 模拟 group 累计字节（copyfile 成功后 +12345，差值=本次）
 	srv         *httptest.Server
 }
 
@@ -37,6 +40,7 @@ func newFakeRCDServer(t *testing.T) *fakeRCDServer {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.mu.Lock()
 			f.gotIgnoreTm = body.Config["IgnoreTimes"] == true
+			f.copyCalled = true
 			f.mu.Unlock()
 		}
 		if r.URL.Path == "/operations/copyfile" || r.URL.Path == "/operations/deletefile" {
@@ -57,6 +61,14 @@ func newFakeRCDServer(t *testing.T) *fakeRCDServer {
 			f.mu.Unlock()
 		}
 		if r.URL.Path == "/core/stats-reset" {
+			f.mu.Lock()
+			resetErr := f.resetErr
+			f.mu.Unlock()
+			if resetErr != "" {
+				w.WriteHeader(500)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": resetErr})
+				return
+			}
 			// runner 传输前清零该 group（独占借出）。
 			f.mu.Lock()
 			f.groupBytes = 0
@@ -65,6 +77,14 @@ func newFakeRCDServer(t *testing.T) *fakeRCDServer {
 			return
 		}
 		if r.URL.Path == "/core/stats" {
+			f.mu.Lock()
+			statsErr := f.statsErr
+			f.mu.Unlock()
+			if statsErr != "" {
+				w.WriteHeader(500)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": statsErr})
+				return
+			}
 			// 传输后读该 group：已清零→本次传输累计，bytes 即本次字节。
 			f.mu.Lock()
 			b := f.groupBytes
@@ -156,5 +176,31 @@ func TestRunCopy_RefreshInjectsIgnoreTimes(t *testing.T) {
 	defer f.mu.Unlock()
 	if !f.gotIgnoreTm {
 		t.Error("refresh 应注入 _config.IgnoreTimes=true")
+	}
+}
+
+func TestRunCopy_StatsResetFailureRetryableNoCopy(t *testing.T) {
+	f := newFakeRCDServer(t)
+	f.resetErr = "stats reset unavailable"
+	res := f.runner(5*time.Second).RunCopy(context.Background(), copyMsg)
+	if res.State != model.StateRetryable || res.ErrorClass != "rcd_stats_reset" {
+		t.Fatalf("stats reset 失败应 RETRYABLE/rcd_stats_reset，got %s/%s", res.State, res.ErrorClass)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.copyCalled {
+		t.Fatal("stats reset 失败不应启动 copy")
+	}
+}
+
+func TestRunCopy_StatsReadFailureStillSuccessBytesZero(t *testing.T) {
+	f := newFakeRCDServer(t)
+	f.statsErr = "stats unavailable"
+	res := f.runner(5*time.Second).RunCopy(context.Background(), copyMsg)
+	if res.State != model.StateSuccess {
+		t.Fatalf("stats read 失败不应阻塞成功，got %s/%s", res.State, res.ErrorClass)
+	}
+	if res.Stats.Bytes != 0 {
+		t.Fatalf("stats read 失败时 bytes 应为 0，got %d", res.Stats.Bytes)
 	}
 }

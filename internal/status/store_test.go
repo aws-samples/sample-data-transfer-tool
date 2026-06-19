@@ -2,7 +2,9 @@ package status
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -66,6 +68,28 @@ func TestRecordTerminal_FailureIncludesBodyAndError(t *testing.T) {
 	}
 	if f.lastTable != "status-tbl" {
 		t.Errorf("表名错: %s", f.lastTable)
+	}
+}
+
+func TestRecordTerminal_TruncatesLargeErrorAndBodyUTF8(t *testing.T) {
+	f := &fakeDDB{}
+	s := NewStore(f, "status-tbl", "hb-tbl")
+	long := strings.Repeat("界", maxTerminalTextBytes)
+	_ = s.RecordTerminal(context.Background(), "s3:b/k", "ts",
+		model.RunResult{
+			State: model.StateFatal, ErrorClass: "fatal",
+			ErrorMessage: long,
+		},
+		"i#0", "ts", long)
+
+	for _, key := range []string{"error_message", "message_body"} {
+		got := sval(f.lastItem[key])
+		if len(got) > maxTerminalTextBytes {
+			t.Errorf("%s 未截断: len=%d", key, len(got))
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("%s 截断后不是合法 UTF-8", key)
+		}
 	}
 }
 

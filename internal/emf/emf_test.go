@@ -66,3 +66,19 @@ func TestEmit_OutputsSingleLineJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestBuild_DimensionsIncludeStateErrorClassCombo(t *testing.T) {
+	doc, err := build(worker.EMFEvent{State: "FATAL", ErrorClass: "src_not_found"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	awsDoc := doc["_aws"].(map[string]any)
+	metrics := awsDoc["CloudWatchMetrics"].([]map[string]any)
+	dims := metrics[0]["Dimensions"].([][]string)
+	for _, dim := range dims {
+		if len(dim) == 2 && dim[0] == "State" && dim[1] == "ErrorClass" {
+			return
+		}
+	}
+	t.Fatalf("Dimensions 缺 State+ErrorClass 组合: %#v", dims)
+}

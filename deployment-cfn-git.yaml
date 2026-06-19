@@ -523,7 +523,7 @@ Resources:
                   chmod 644 /etc/rclone-rcd-mem.env
 
                   # ① rclone rcd 守护进程：所有传输走 operations/copyfile，连接池复用（消灭每文件 fork+握手）。
-                  # 全套 rclone flag 在此一次给全；per-call 仅用 _config 覆盖 bwlimit/tpslimit。
+                  # 全套 rclone flag 在此一次给全；限速由 go-worker 调 rcd 全局端点生效。
                   # 口令经 EnvironmentFile 注入，ExecStart 用 ${!RCD_PASS}（systemd 运行时展开）。
                   # ⚠️ --rc-job-expire-duration 必须短（1m）：rclone 把**每个** rc 调用都登记为 job
                   # 并在内存保留到 expire（同步调用也算 job）。同步模式下 worker 拿到结果即不再查 job，
@@ -567,7 +567,7 @@ Resources:
                   WantedBy=multi-user.target
                   EOF
 
-                  # ② go-worker：单进程多 goroutine（WORKER_GOROUTINES ≈ rcd --transfers）。
+                  # ② go-worker：单进程多 goroutine（WORKER_GOROUTINES 必须等于 rcd --transfers）。
                   # 依赖 rcd，启动时探 rc/noop 就绪才消费。
                   # 日志双流：EMF→stdout→worker-emf log（CW 抽取指标）；分级运维日志（WARNING+）
                   # → OPS_LOG_PATH=worker-ops-0.log（CW 采集 worker-ops 组，失败/poison 不登机可查）。
@@ -590,6 +590,7 @@ Resources:
                   Environment="RCD_ADDR=127.0.0.1:5572"
                   Environment="RCD_USER=worker"
                   Environment="WORKER_GOROUTINES=${WorkerThreads}"
+                  Environment="RCLONE_TRANSFERS=${WorkerThreads}"
                   Environment="RECEIVER_GOROUTINES=2"
                   Environment="RATELIMIT_BWLIMIT_PARAM=${RatelimitBwlimitParam}"
                   Environment="RATELIMIT_TPSLIMIT_PARAM=${RatelimitTpslimitParam}"

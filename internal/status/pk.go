@@ -2,7 +2,7 @@
 package status
 
 import (
-	"crypto/md5" //nolint:gosec // 非安全用途，仅用于打散分片，必须与 Python hashlib.md5 字节级一致
+	"crypto/md5" // #nosec G501 -- 非安全用途，仅用于打散分片，必须与 Python hashlib.md5 字节级一致
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -19,7 +19,7 @@ const shardCount = 256
 // 注意 md5 十六进制摘要是 128-bit 整数，远超 int64，必须用 big.Int 取模
 // （不能截断高位——那会得到与 Python 不同的 shard）。golden 值见 pk_test.go。
 func MakePK(source string) string {
-	sum := md5.Sum([]byte(source)) //nolint:gosec // 与 Python 对拍，刻意用 md5
+	sum := md5.Sum([]byte(source)) // #nosec G401 -- 与 Python 对拍，刻意用 md5
 	hexDigest := hex.EncodeToString(sum[:])
 	// 把完整 128-bit 十六进制摘要当大整数解析后 % 256。
 	n := new(big.Int)

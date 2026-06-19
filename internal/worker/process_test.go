@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/aws-samples/sample-data-transfer-tool/internal/message"
@@ -19,17 +20,20 @@ type recorder struct {
 	reported       bool
 	reportState    string
 	reportEvent    EMFEvent
+	recordErr      error
+	deleteErr      error
 }
 
 func (r *recorder) effects(result model.RunResult) Effects {
 	return Effects{
 		RunCopy: func(_ context.Context, _ message.TransferMessage) model.RunResult { return result },
-		Delete:  func() error { r.deleted = true; return nil },
+		Delete:  func() error { r.deleted = true; return r.deleteErr },
 		Requeue: func(d int) error { r.requeued = true; r.requeueDelay = d; return nil },
-		Record: func(src, _ string, res model.RunResult, body string) {
+		Record: func(src, _ string, res model.RunResult, body string) error {
 			r.recordedSrc = src
 			r.recordedResult = res
 			r.recordedBody = body
+			return r.recordErr
 		},
 		Report: func(ev EMFEvent) { r.reported = true; r.reportState = ev.State; r.reportEvent = ev },
 	}
@@ -167,4 +171,40 @@ func TestQueueTypeDimension(t *testing.T) {
 		t.Fatal("应上报 EMF")
 	}
 	// 200MB ≥ 100MB 阈值 → large（仅维度，非路由）
+}
+
+func TestRecordFailureRequeuesAndReportsUnknown(t *testing.T) {
+	r := &recorder{recordErr: errors.New("ddb down")}
+	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+		r.effects(model.RunResult{State: model.StateSuccess}))
+	if !out.RecordFailed || out.Counted || out.State != model.StateUnknown {
+		t.Fatalf("record failure outcome=%+v", out)
+	}
+	if r.deleted {
+		t.Error("DDB 终态写失败时不能删除 SQS 消息")
+	}
+	if !r.requeued || r.requeueDelay != 60 {
+		t.Errorf("DDB 终态写失败应 60s 后重试，got requeued=%v delay=%d", r.requeued, r.requeueDelay)
+	}
+	if r.reportEvent.State != string(model.StateUnknown) || r.reportEvent.ErrorClass != "record_fail" {
+		t.Errorf("应上报 UNKNOWN/record_fail，got %+v", r.reportEvent)
+	}
+}
+
+func TestDeleteFailureReportsUnknownNotSuccess(t *testing.T) {
+	r := &recorder{deleteErr: errors.New("sqs delete failed")}
+	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+		r.effects(model.RunResult{State: model.StateSuccess}))
+	if out.Counted || out.State != model.StateUnknown {
+		t.Fatalf("delete failure outcome=%+v", out)
+	}
+	if !r.deleted {
+		t.Error("SUCCESS 应尝试删除消息")
+	}
+	if r.requeued {
+		t.Error("delete failure 不应显式 requeue，等待 visibility 超时重投")
+	}
+	if r.reportEvent.State != string(model.StateUnknown) || r.reportEvent.ErrorClass != "delete_fail" {
+		t.Errorf("应上报 UNKNOWN/delete_fail，got %+v", r.reportEvent)
+	}
 }

@@ -15,23 +15,24 @@ import (
 
 // Effects 单条消息处理的副作用接口（全注入，便于纯逻辑测试，不依赖真实 AWS/rcd）。
 type Effects struct {
-	// RunCopy 提交并轮询一次传输，返回四态结果。封装 rcd copyfile→job/status→job/stop。
+	// RunCopy 同步执行一次传输，返回四态结果。封装 rcd copyfile/deletefile。
 	RunCopy func(ctx context.Context, msg message.TransferMessage) model.RunResult
 	// Delete 删 SQS 消息（仅 SUCCESS 调用）。
 	Delete func() error
 	// Requeue 改 VisibilityTimeout 为 delay 秒，快速重投（失败态调用）。
 	Requeue func(delaySeconds int) error
 	// Record 写 DDB 终态。SUCCESS 不传 body（百万级行省容量），失败传完整 body。
-	Record func(source, attemptTS string, result model.RunResult, body string)
+	Record func(source, attemptTS string, result model.RunResult, body string) error
 	// Report 发 EMF（stdout JSON）。
 	Report func(ev EMFEvent)
 }
 
 // Outcome 处理结果：四态 + 是否计数（UNKNOWN 不计数）。
 type Outcome struct {
-	State   model.State
-	Counted bool
-	Poison  bool // 解析失败的脏消息（单独计数，不混进 unknown）
+	State        model.State
+	Counted      bool
+	Poison       bool // 解析失败的脏消息（单独计数，不混进 unknown）
+	RecordFailed bool
 }
 
 // EMFEvent 上报给监控的低基数事件。
@@ -78,7 +79,12 @@ func ProcessMessage(
 			State: model.StateFatal, ExitCode: -1,
 			ErrorClass: "poison_message", ErrorMessage: err.Error(),
 		}
-		eff.Record(key, attemptTS, poison, body)
+		if recErr := eff.Record(key, attemptTS, poison, body); recErr != nil {
+			obslog.Errorf("poison 终态写 DDB 失败: %v | key=%s | body=%.512s", recErr, key, body)
+			reportRecordFail(eff, queueType, instanceID, string(model.OpCopy))
+			_ = eff.Requeue(60)
+			return Outcome{State: model.StateUnknown, Counted: false, Poison: true, RecordFailed: true}
+		}
 		_ = eff.Requeue(0)
 		// 打 ERROR 到 worker-ops（对齐 Python）：哪条消息坏了、坏在哪，不登机即可定位。
 		obslog.Errorf("poison 消息: %v | key=%s | body=%.512s", err, key, body)
@@ -102,7 +108,13 @@ func ProcessMessage(
 	if recordKey == "" {
 		recordKey = msg.Destination
 	}
-	eff.Record(recordKey, attemptTS, result, recordBody)
+	if recErr := eff.Record(recordKey, attemptTS, result, recordBody); recErr != nil {
+		obslog.Errorf("终态写 DDB 失败 state=%s error_class=%s source=%s err=%v",
+			result.State, emptyToNone(result.ErrorClass), recordKey, recErr)
+		reportRecordFail(eff, queueType, instanceID, string(msg.Op))
+		_ = eff.Requeue(60)
+		return Outcome{State: model.StateUnknown, Counted: false, RecordFailed: true}
+	}
 
 	// 失败打 ERROR 到 worker-ops（对齐 Python）：不登机即可在 CW 看失败根因。
 	// SUCCESS 不打（百万级成功会刷爆日志）。
@@ -112,6 +124,35 @@ func ProcessMessage(
 			recordKey, result.CmdStr, result.ErrorMessage)
 	}
 
+	switch result.State {
+	case model.StateSuccess:
+		if err := eff.Delete(); err != nil {
+			// 删失败：消息会占 visibility 直到超时重投。不能上报 SUCCESS，
+			// 否则 FileCount 会虚高；用 UNKNOWN/delete_fail 暴露副作用失败。
+			eff.Report(EMFEvent{
+				QueueType: queueType, ErrorClass: "delete_fail", InstanceID: instanceID,
+				State: string(model.StateUnknown), Op: string(msg.Op),
+			})
+			return Outcome{State: model.StateUnknown, Counted: false}
+		}
+		reportResult(eff, queueType, instanceID, msg, result)
+		return Outcome{State: model.StateSuccess, Counted: true}
+	case model.StateRetryable:
+		_ = eff.Requeue(classify.RetryDelaySeconds(result.ErrorClass))
+		reportResult(eff, queueType, instanceID, msg, result)
+		return Outcome{State: model.StateRetryable, Counted: true}
+	case model.StateFatal:
+		_ = eff.Requeue(0)
+		reportResult(eff, queueType, instanceID, msg, result)
+		return Outcome{State: model.StateFatal, Counted: true}
+	default: // UNKNOWN
+		_ = eff.Requeue(0)
+		reportResult(eff, queueType, instanceID, msg, result)
+		return Outcome{State: model.StateUnknown, Counted: false}
+	}
+}
+
+func reportResult(eff Effects, queueType, instanceID string, msg message.TransferMessage, result model.RunResult) {
 	eff.Report(EMFEvent{
 		QueueType:  queueType,
 		ErrorClass: emptyToNone(result.ErrorClass),
@@ -122,25 +163,16 @@ func ProcessMessage(
 		Elapsed:    result.Stats.ElapsedSeconds,
 		Speed:      result.Stats.Speed,
 	})
+}
 
-	switch result.State {
-	case model.StateSuccess:
-		if err := eff.Delete(); err != nil {
-			// 删失败：消息会占 visibility 直到超时重投。计 SUCCESS（传输确已完成），
-			// 但删失败需被观测（调用方在 Delete 内部计数告警）。
-			return Outcome{State: model.StateSuccess, Counted: true}
-		}
-		return Outcome{State: model.StateSuccess, Counted: true}
-	case model.StateRetryable:
-		_ = eff.Requeue(classify.RetryDelaySeconds(result.ErrorClass))
-		return Outcome{State: model.StateRetryable, Counted: true}
-	case model.StateFatal:
-		_ = eff.Requeue(0)
-		return Outcome{State: model.StateFatal, Counted: true}
-	default: // UNKNOWN
-		_ = eff.Requeue(0)
-		return Outcome{State: model.StateUnknown, Counted: false}
+func reportRecordFail(eff Effects, queueType, instanceID, op string) {
+	if op == "" {
+		op = string(model.OpCopy)
 	}
+	eff.Report(EMFEvent{
+		QueueType: queueType, ErrorClass: "record_fail", InstanceID: instanceID,
+		State: string(model.StateUnknown), Op: op,
+	})
 }
 
 // poisonKey 坏消息的可搜索 DDB key。能解析出 source 时用真实 source（按源路径可直接

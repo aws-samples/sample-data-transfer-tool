@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -30,14 +31,14 @@ import (
 
 func main() {
 	var (
-		queueURL    = flag.String("queue", "", "SQS 队列 URL（必填）")
-		bucket      = flag.String("bucket", "", "源桶（必填）")
-		prefix      = flag.String("prefix", "", "源 key 前缀，如 stress-small/")
-		dstPrefix   = flag.String("dst-prefix", "feedtest", "目标 key 前缀")
-		count       = flag.Int("count", 10000, "最多灌多少条（单轮）")
-		conc        = flag.Int("conc", 48, "并发 SendMessageBatch 协程数")
-		repeat      = flag.Int("repeat", 1, "重复轮数（每轮目标 prefix 带 -rN 后缀去重）")
-		region = flag.String("region", "eu-south-2", "AWS region")
+		queueURL  = flag.String("queue", "", "SQS 队列 URL（必填）")
+		bucket    = flag.String("bucket", "", "源桶（必填）")
+		prefix    = flag.String("prefix", "", "源 key 前缀，如 stress-small/")
+		dstPrefix = flag.String("dst-prefix", "feedtest", "目标 key 前缀")
+		count     = flag.Int("count", 10000, "最多灌多少条（单轮）")
+		conc      = flag.Int("conc", 48, "并发 SendMessageBatch 协程数")
+		repeat    = flag.Int("repeat", 1, "重复轮数（每轮目标 prefix 带 -rN 后缀去重）")
+		region    = flag.String("region", "eu-south-2", "AWS region")
 	)
 	flag.Parse()
 	if *queueURL == "" || *bucket == "" {
@@ -107,13 +108,20 @@ func feedRound(ctx context.Context, sqsc *sqs.Client, queueURL, bucket string,
 						rel = k[idx+1:] // 去掉源前缀首段，避免目标 key 套娃
 					}
 					dst := fmt.Sprintf("%s/r%d/%s", dstPrefix, round, rel)
-					body := buildBody(bucket, k, dst)
+					body, err := buildBody(bucket, k, dst)
+					if err != nil {
+						log.Printf("buildBody 失败 key=%s: %v", k, err)
+						continue
+					}
 					entries = append(entries, types.SendMessageBatchRequestEntry{
 						Id:          aws.String(strconv.Itoa(j)),
 						MessageBody: aws.String(body),
 					})
 				}
-				_, err := sqsc.SendMessageBatch(ctx, &sqs.SendMessageBatchInput{
+				if len(entries) == 0 {
+					continue
+				}
+				out, err := sqsc.SendMessageBatch(ctx, &sqs.SendMessageBatchInput{
 					QueueUrl: aws.String(queueURL),
 					Entries:  entries,
 				})
@@ -121,7 +129,11 @@ func feedRound(ctx context.Context, sqsc *sqs.Client, queueURL, bucket string,
 					log.Printf("SendMessageBatch 失败: %v", err)
 					continue
 				}
-				sent.Add(int64(len(entries)))
+				if len(out.Failed) > 0 {
+					log.Printf("SendMessageBatch 部分失败: failed=%d success=%d detail=%v",
+						len(out.Failed), len(out.Successful), out.Failed)
+				}
+				sent.Add(int64(len(out.Successful)))
 			}
 		}()
 	}
@@ -139,12 +151,17 @@ func feedRound(ctx context.Context, sqsc *sqs.Client, queueURL, bucket string,
 
 // buildBody 组装一条迁移消息体（与 worker message.TransferMessage 契约一致）。
 // rcd 模式不支持 per-message rclone 参数，消息体只含 source/destination（op 默认 copy）。
-func buildBody(bucket, srcKey, dstKey string) string {
-	var sb strings.Builder
-	sb.WriteString(`{"source":"s3:`)
-	sb.WriteString(bucket + "/" + srcKey)
-	sb.WriteString(`","destination":"s3:`)
-	sb.WriteString(bucket + "/" + dstKey)
-	sb.WriteString(`"}`)
-	return sb.String()
+func buildBody(bucket, srcKey, dstKey string) (string, error) {
+	body := struct {
+		Source      string `json:"source"`
+		Destination string `json:"destination"`
+	}{
+		Source:      "s3:" + bucket + "/" + srcKey,
+		Destination: "s3:" + bucket + "/" + dstKey,
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }

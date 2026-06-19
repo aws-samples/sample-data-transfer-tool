@@ -75,11 +75,12 @@ func Run(ctx context.Context, cfg Config) error {
 	watchdog.Ready()
 	go watchdog.Run(ctx, consumer.Progress)
 
-	obslog.Infof("worker 启动: %d receivers / %d workers → %s", cfg.Receivers, cfg.Workers, cfg.QueueURL)
+	obslog.Infof("worker 启动: %d receivers / %d workers / rclone_transfers=%d → %s",
+		cfg.Receivers, cfg.Workers, cfg.RcloneTransfers, cfg.QueueURL)
 	consumer.Run(ctx) // 阻塞到 ctx 取消后优雅 drain
-	obslog.Infof("worker 已停止 | total=%d success=%d retryable=%d fatal=%d unknown=%d poison=%d delete_fail=%d requeue_fail=%d",
+	obslog.Infof("worker 已停止 | total=%d success=%d retryable=%d fatal=%d unknown=%d poison=%d record_fail=%d delete_fail=%d requeue_fail=%d",
 		stats.Total.Load(), stats.Success.Load(), stats.Retryable.Load(), stats.Fatal.Load(),
-		stats.Unknown.Load(), stats.Poison.Load(), stats.DeleteFail.Load(), stats.RequeueFail.Load())
+		stats.Unknown.Load(), stats.Poison.Load(), stats.RecordFail.Load(), stats.DeleteFail.Load(), stats.RequeueFail.Load())
 	return nil
 }
 
@@ -126,9 +127,9 @@ func progressLoop(ctx context.Context, stats *worker.Stats) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			obslog.Infof("进度: total=%d success=%d retryable=%d fatal=%d unknown=%d poison=%d delete_fail=%d requeue_fail=%d",
+			obslog.Infof("进度: total=%d success=%d retryable=%d fatal=%d unknown=%d poison=%d record_fail=%d delete_fail=%d requeue_fail=%d",
 				stats.Total.Load(), stats.Success.Load(), stats.Retryable.Load(), stats.Fatal.Load(),
-				stats.Unknown.Load(), stats.Poison.Load(), stats.DeleteFail.Load(), stats.RequeueFail.Load())
+				stats.Unknown.Load(), stats.Poison.Load(), stats.RecordFail.Load(), stats.DeleteFail.Load(), stats.RequeueFail.Load())
 		}
 	}
 }

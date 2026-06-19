@@ -8,12 +8,13 @@ package ratelimit
 
 import (
 	"context"
-	"log"
 	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
+
+	"github.com/aws-samples/sample-data-transfer-tool/internal/obslog"
 )
 
 // SSMAPI SSM 客户端最小接口（便于测试注入）。
@@ -27,7 +28,7 @@ type RCDLimiter interface {
 	SetTPSLimit(ctx context.Context, tps float64) error
 }
 
-// Refresher 周期读 SSM → 设 rcd 全局限速。读不到/空 → off（不限速），不阻断传输。
+// Refresher 周期读 SSM → 设 rcd 全局限速。读取失败保留旧值；初始无旧值才 off。
 type Refresher struct {
 	ssm          SSMAPI
 	rcd          RCDLimiter
@@ -57,41 +58,68 @@ func (r *Refresher) Run(ctx context.Context, interval time.Duration) {
 }
 
 func (r *Refresher) refresh(ctx context.Context) {
-	bw := r.read(ctx, r.bwlimitParam)  // "off" 或 "745M"
-	tps := r.read(ctx, r.tpslimitName) // "off" 或 "156.25"
+	bw, bwOK := r.read(ctx, r.bwlimitParam)   // "off" 或 "745M"
+	tps, tpsOK := r.read(ctx, r.tpslimitName) // "off" 或 "156.25"
 
-	// 带宽：值变了才设。rcd 的 core/bwlimit 接受 "off"/"100M"。
-	if bw != r.lastBw {
-		if err := r.rcd.SetBwLimit(ctx, bw); err != nil {
-			log.Printf("设 rcd bwlimit=%s 失败: %v", bw, err)
-		} else {
-			r.lastBw = bw
-		}
+	if bwOK {
+		r.applyBw(ctx, bw)
+	} else if r.lastBw == "" {
+		r.applyBw(ctx, "off")
+	} else {
+		obslog.Warnf("读取 bwlimit SSM 失败，保留旧值 %s", r.lastBw)
 	}
-	// TPS：off→0（不限），否则 parse float。
-	if tps != r.lastTps {
-		v := 0.0
-		if tps != "off" {
-			if f, err := strconv.ParseFloat(tps, 64); err == nil {
-				v = f
-			}
-		}
-		if err := r.rcd.SetTPSLimit(ctx, v); err != nil {
-			log.Printf("设 rcd tpslimit=%v 失败: %v", v, err)
-		} else {
-			r.lastTps = tps
-		}
+
+	if tpsOK {
+		r.applyTPS(ctx, tps)
+	} else if r.lastTps == "" {
+		r.applyTPS(ctx, "off")
+	} else {
+		obslog.Warnf("读取 tpslimit SSM 失败，保留旧值 %s", r.lastTps)
 	}
 }
 
-// read 读单个 SSM 参数；读不到/空 → "off"（failsafe 不限速，不阻断传输）。
-func (r *Refresher) read(ctx context.Context, name string) string {
+func (r *Refresher) applyBw(ctx context.Context, bw string) {
+	if bw == r.lastBw {
+		return
+	}
+	if err := r.rcd.SetBwLimit(ctx, bw); err != nil {
+		obslog.Warnf("设 rcd bwlimit=%s 失败: %v", bw, err)
+		return
+	}
+	r.lastBw = bw
+}
+
+func (r *Refresher) applyTPS(ctx context.Context, tps string) {
+	if tps == r.lastTps {
+		return
+	}
+	v := 0.0
+	if tps != "off" {
+		f, err := strconv.ParseFloat(tps, 64)
+		if err != nil {
+			obslog.Warnf("SSM tpslimit 非法，保留旧值 %s: value=%q err=%v", r.lastTps, tps, err)
+			return
+		}
+		v = f
+	}
+	if err := r.rcd.SetTPSLimit(ctx, v); err != nil {
+		obslog.Warnf("设 rcd tpslimit=%v 失败: %v", v, err)
+		return
+	}
+	r.lastTps = tps
+}
+
+// read 读单个 SSM 参数；空值视作 off，读取失败返回 ok=false 由调用方保留旧值。
+func (r *Refresher) read(ctx context.Context, name string) (value string, ok bool) {
 	if name == "" {
-		return "off"
+		return "off", true
 	}
 	out, err := r.ssm.GetParameter(ctx, &ssm.GetParameterInput{Name: aws.String(name)})
-	if err != nil || out.Parameter == nil || out.Parameter.Value == nil || *out.Parameter.Value == "" {
-		return "off"
+	if err != nil {
+		return "", false
 	}
-	return *out.Parameter.Value
+	if out.Parameter == nil || out.Parameter.Value == nil || *out.Parameter.Value == "" {
+		return "off", true
+	}
+	return *out.Parameter.Value, true
 }

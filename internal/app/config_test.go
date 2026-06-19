@@ -25,6 +25,45 @@ func TestFromEnv_Defaults(t *testing.T) {
 	}
 }
 
+func TestFromEnv_PositiveIntsFailFast(t *testing.T) {
+	base := map[string]string{"AWS_REGION": "eu-south-2", "QUEUE_URL": "q"}
+	for _, tc := range []struct {
+		key   string
+		value string
+	}{
+		{"WORKER_GOROUTINES", "0"},
+		{"RECEIVER_GOROUTINES", "-1"},
+		{"RCLONE_TIMEOUT_SECONDS", "abc"},
+		{"QUEUE_VISIBILITY_TIMEOUT", "0"},
+		{"RCLONE_TRANSFERS", "-2"},
+	} {
+		env := map[string]string{}
+		for k, v := range base {
+			env[k] = v
+		}
+		env[tc.key] = tc.value
+		if _, err := FromEnv(envMap(env)); err == nil {
+			t.Errorf("%s=%q 应 fail-fast", tc.key, tc.value)
+		}
+	}
+}
+
+func TestFromEnv_RcloneTransfersMustMatchWorkers(t *testing.T) {
+	base := map[string]string{
+		"AWS_REGION":        "eu-south-2",
+		"QUEUE_URL":         "q",
+		"WORKER_GOROUTINES": "8",
+	}
+	base["RCLONE_TRANSFERS"] = "8"
+	if _, err := FromEnv(envMap(base)); err != nil {
+		t.Fatalf("RCLONE_TRANSFERS == WORKER_GOROUTINES 应通过: %v", err)
+	}
+	base["RCLONE_TRANSFERS"] = "4"
+	if _, err := FromEnv(envMap(base)); err == nil {
+		t.Fatal("RCLONE_TRANSFERS != WORKER_GOROUTINES 应 fail-fast")
+	}
+}
+
 func TestFromEnv_MissingRequired(t *testing.T) {
 	if _, err := FromEnv(envMap(map[string]string{"QUEUE_URL": "x"})); err == nil {
 		t.Error("缺 AWS_REGION 应报错")

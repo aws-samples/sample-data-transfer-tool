@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -134,5 +135,20 @@ func TestSetTPSLimit(t *testing.T) {
 	defer srv.Close()
 	if err := clientFor(srv).SetTPSLimit(context.Background(), 156.25); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOversizedSuccessResponseFailsBeforeUnmarshal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", maxResponseBodyBytes+1)))
+	}))
+	defer srv.Close()
+
+	_, err := NewWithBaseURL(srv.URL, "u", "pw", 16).StatsByGroup(context.Background(), "g")
+	if err == nil {
+		t.Fatal("超大响应应返回错误")
+	}
+	if !strings.Contains(err.Error(), "响应超过") {
+		t.Fatalf("错误应说明响应过大，got %v", err)
 	}
 }

@@ -51,7 +51,7 @@ func Setup(path string, maxBytes int64, keep int) error {
 	if path == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		// 目录建不了：降级仅控制台（不阻断启动，对齐 Python 容错）。
 		std.console.Printf("WARNING obslog: 无法建日志目录 %s: %v（降级仅控制台）", filepath.Dir(path), err)
 		return nil
@@ -62,8 +62,12 @@ func Setup(path string, maxBytes int64, keep int) error {
 		return nil
 	}
 	std.mu.Lock()
+	old := std.opsFile
 	std.opsFile = rw
 	std.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
 	return nil
 }
 
@@ -101,7 +105,7 @@ type rotWriter struct {
 }
 
 func newRotWriter(path string, maxBytes int64, keep int) (*rotWriter, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- OPS_LOG_PATH is operator-controlled worker configuration.
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +123,9 @@ func (w *rotWriter) Write(p []byte) (int, error) {
 	if w.maxBytes > 0 && w.size+int64(len(p)) > w.maxBytes {
 		w.rotate()
 	}
+	if w.f == nil {
+		return 0, fmt.Errorf("ops log unavailable: %s", w.path)
+	}
 	n, err := w.f.Write(p)
 	w.size += int64(n)
 	return n, err
@@ -126,14 +133,17 @@ func (w *rotWriter) Write(p []byte) (int, error) {
 
 // rotate 关闭当前文件，path→path.1→path.2... 滚动，重开 path。
 func (w *rotWriter) rotate() {
-	_ = w.f.Close()
+	if w.f != nil {
+		_ = w.f.Close()
+		w.f = nil
+	}
 	for i := w.keep - 1; i >= 1; i-- {
 		_ = os.Rename(fmt.Sprintf("%s.%d", w.path, i), fmt.Sprintf("%s.%d", w.path, i+1))
 	}
 	if w.keep >= 1 {
 		_ = os.Rename(w.path, w.path+".1")
 	}
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- same operator-controlled path opened during rotation.
 	if err != nil {
 		// 重开失败：退回 stderr，避免丢日志崩溃。
 		w.f = nil
@@ -142,6 +152,17 @@ func (w *rotWriter) rotate() {
 	}
 	w.f = f
 	w.size = 0
+}
+
+func (w *rotWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		return nil
+	}
+	err := w.f.Close()
+	w.f = nil
+	return err
 }
 
 var _ io.Writer = (*rotWriter)(nil)

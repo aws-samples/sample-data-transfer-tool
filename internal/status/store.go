@@ -3,7 +3,9 @@ package status
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -17,8 +19,8 @@ type DDBAPI interface {
 	PutItem(ctx context.Context, in *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
 }
 
-// maxMessageBodyBytes message_body 截断上限（对齐 Python 16KB，防 DDB 单 item 400KB 超限）。
-const maxMessageBodyBytes = 16 * 1024
+// maxTerminalTextBytes 终态错误文本/消息体截断上限（对齐 Python 16KB，防 DDB 单 item 400KB 超限）。
+const maxTerminalTextBytes = 16 * 1024
 
 // heartbeatTTLSeconds 心跳存活窗口（对齐 Python 300s）。
 const heartbeatTTLSeconds = 300
@@ -44,7 +46,7 @@ func (s *Store) RecordTerminal(
 ) error {
 	// 时间语义：attempt_timestamp/started_at = 传输开始（SK，也是 worker 取到消息时刻）；
 	// updated_at = 终态写入时刻（≈传输完成）。elapsed_seconds 是 runner wall-clock 实测
-	// 传输耗时；transferred_bytes/speed_bps 来自 SQS object_size + 耗时算的平均速率。
+	// 传输耗时；transferred_bytes/speed_bps 来自 runner 读取的 rcd group stats。
 	item := map[string]ddbtypes.AttributeValue{
 		"source_hash":       &ddbtypes.AttributeValueMemberS{Value: MakePK(source)},
 		"attempt_timestamp": &ddbtypes.AttributeValueMemberS{Value: attemptTS},
@@ -62,13 +64,10 @@ func (s *Store) RecordTerminal(
 		item["error_class"] = &ddbtypes.AttributeValueMemberS{Value: result.ErrorClass}
 	}
 	if result.ErrorMessage != "" {
-		item["error_message"] = &ddbtypes.AttributeValueMemberS{Value: result.ErrorMessage}
+		item["error_message"] = &ddbtypes.AttributeValueMemberS{Value: truncateUTF8Bytes(result.ErrorMessage, maxTerminalTextBytes)}
 	}
 	if body != "" {
-		if len(body) > maxMessageBodyBytes {
-			body = body[:maxMessageBodyBytes]
-		}
-		item["message_body"] = &ddbtypes.AttributeValueMemberS{Value: body}
+		item["message_body"] = &ddbtypes.AttributeValueMemberS{Value: truncateUTF8Bytes(body, maxTerminalTextBytes)}
 	}
 	_, err := s.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(s.statusTable),
@@ -93,3 +92,23 @@ func (s *Store) WriteHeartbeat(ctx context.Context, instanceID, nowISO string, n
 
 // NowISO 当前 UTC 时间戳，对齐 Python now_iso 形态（毫秒，无时区后缀）。
 func NowISO() string { return time.Now().UTC().Format("2006-01-02T15:04:05.000") }
+
+func truncateUTF8Bytes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max && utf8.ValidString(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(min(len(s), max))
+	for _, r := range s {
+		// range over string 已把非法字节解码为 RuneError(U+FFFD)，RuneLen 恒 ≥ 1。
+		n := utf8.RuneLen(r)
+		if b.Len()+n > max {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}

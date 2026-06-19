@@ -57,3 +57,28 @@ func TestSetupEmptyPathNoError(t *testing.T) {
 		t.Errorf("空 path 应静默成功: %v", err)
 	}
 }
+
+func TestSetupPermissions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secure", "ops.log")
+	if err := Setup(path, 10*1024*1024, 1); err != nil {
+		t.Fatal(err)
+	}
+	dinfo, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dinfo.Mode().Perm(); got != 0o750 {
+		t.Errorf("日志目录权限=%o, want 750", got)
+	}
+	if _, err := std.opsFile.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	finfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := finfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("日志文件权限=%o, want 600", got)
+	}
+}

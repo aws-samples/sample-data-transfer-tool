@@ -20,7 +20,7 @@ systemd ──┬─ rclone-rcd.service   常驻 rcd（127.0.0.1:5572，全套 r
           └─ go-worker.service    Go 单进程（Type=notify，依赖 rcd ready）
 
 go-worker 进程内：
-  RECEIVER_GOROUTINES 个 receiver ─批量拉 SQS→ channel(背压) ─→ WORKER_GOROUTINES 个 worker
+  RECEIVER_GOROUTINES 个 receiver ─按 worker slots 拉 SQS─→ WORKER_GOROUTINES 个 worker
      每个 worker：parse → 同步 operations/copyfile（阻塞到完成）→ 四态副作用
   + heartbeat(30s 写 DDB) + ratelimit(60s 读 SSM→设 rcd 全局) + watchdog(sd_notify) goroutine
 ```
@@ -36,7 +36,7 @@ go-worker 进程内：
 | rcd `--transfers`（=CFN `WorkerThreads`）| rcd 同时**执行**多少传输 | rcd 启动 flag |
 | `--bwlimit` / `--tpslimit` | 带宽 / 每秒事务数（**rcd 全局**） | 控制器 Lambda 写 SSM，worker 经 rc 设 rcd 全局 |
 
-⚠️ `WORKER_GOROUTINES` 必须 = `--transfers`（提交=执行对齐，否则 job 在 rcd 内排队）。
+⚠️ `WORKER_GOROUTINES` 必须 = `--transfers`（提交=执行对齐，否则请求在 rcd 内排队）。
 CFN 用单一参数 `WorkerThreads` 同时驱动两者。in-flight 约束 `MaxSize(449) × WorkerThreads ≤ 115000`。
 N 从几十起步压测，看 GCS/S3 429 拐点找甜点。
 
