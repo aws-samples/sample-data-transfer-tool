@@ -37,7 +37,8 @@ go-worker 进程内：
 | `--bwlimit` / `--tpslimit` | 带宽 / 每秒事务数（**rcd 全局**） | 控制器 Lambda 写 SSM，worker 经 rc 设 rcd 全局 |
 
 ⚠️ `WORKER_GOROUTINES` 必须 = `--transfers`（提交=执行对齐，否则请求在 rcd 内排队）。
-CFN 用单一参数 `WorkerThreads` 同时驱动两者。in-flight 约束 `MaxSize(449) × WorkerThreads ≤ 115000`。
+设了 `RCLONE_TRANSFERS` 时 **启动 fail-fast 强校验 `RCLONE_TRANSFERS == WORKER_GOROUTINES`**，
+不等则拒启动。CFN 用单一参数 `WorkerThreads` 同时驱动两者。in-flight 约束 `MaxSize(449) × WorkerThreads ≤ 115000`。
 N 从几十起步压测，看 GCS/S3 429 拐点找甜点。
 
 > 限速是 **rcd 全局**（每台 EC2 一个 rcd，core/bwlimit + options/set 涵盖该机所有传输），
@@ -69,6 +70,8 @@ internal/
   app/        配置(env) + 组装运行（Run/heartbeat/ratelimit/watchdog 接线）
   worker/     消费循环(consume) + 四态决策(process) + rcd 执行(runner)
   rcd/        rclone rcd HTTP 客户端（copyfile/deletefile/限速/stats）
+              stats group 用固定大小池复用（封顶 StatsInfo 防 OOM）；首次 reset
+              尚未建立的 group 得 `group not found` = 零态，视作成功不阻断传输
   message/    SQS 消息解析 + endpoint 拆分
   model/      四态 + 传输契约
   classify/   错误文本 → error_class + 四态
@@ -89,6 +92,7 @@ ops/          运维 CLI（migops.sh）
 ```bash
 go build ./...
 go test ./...                 # 全部单测（make_pk 与 Python 字节级对拍 + 防双写命门）
+go test -race ./internal/worker/  # worker 并发命门（slot 信号量 / inflight 计数 / ctx 取消）
 # 交叉编译部署目标（必须匹配实例 CpuArch）
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o go-worker-linux-amd64 .
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o go-worker-linux-arm64 .
