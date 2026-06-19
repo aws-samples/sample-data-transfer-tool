@@ -138,6 +138,35 @@ func TestSetTPSLimit(t *testing.T) {
 	}
 }
 
+// rcd 的 stats group 只在首次有传输写入 _group 时才创建；传输前 reset 一个尚不存在的
+// group，core/stats-reset 返回 `group "<g>" not found`。此时计数本就是 0（零态已达成），
+// 应视作成功而非失败，否则每个 group 首用必失败 → 传输永不发起 → group 永远建不起来。
+func TestResetStatsGroup_NotFoundTreatedAsZeroState(t *testing.T) {
+	srv := newFakeRCD(t, func(path string, body map[string]any) (int, any) {
+		if path != "/core/stats-reset" {
+			t.Errorf("应调 core/stats-reset，got %s", path)
+		}
+		g, _ := body["group"].(string)
+		return 500, map[string]any{"error": "group \"" + g + "\" not found"}
+	})
+	defer srv.Close()
+	if err := clientFor(srv).ResetStatsGroup(context.Background(), "go-worker-0"); err != nil {
+		t.Fatalf("group 不存在 = 零态，reset 应视作成功，got: %v", err)
+	}
+}
+
+// 仅吞 group-not-found；其他 reset 错误（网络/认证/参数/endpoint）必须照常传播，
+// 否则会让传输在未确认 reset 的状态下继续。
+func TestResetStatsGroup_OtherErrorsPropagate(t *testing.T) {
+	srv := newFakeRCD(t, func(path string, body map[string]any) (int, any) {
+		return 500, map[string]any{"error": "couldn't connect to backend"}
+	})
+	defer srv.Close()
+	if err := clientFor(srv).ResetStatsGroup(context.Background(), "go-worker-0"); err == nil {
+		t.Fatal("非 not-found 的 reset 错误必须传播，不能吞掉")
+	}
+}
+
 func TestOversizedSuccessResponseFailsBeforeUnmarshal(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(strings.Repeat("x", maxResponseBodyBytes+1)))

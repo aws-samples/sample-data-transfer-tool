@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -109,7 +110,17 @@ func (c *Client) StatsByGroup(ctx context.Context, group string) (GroupStats, er
 // 里长期复用，不重新引入 per-call StatsInfo 泄漏）。传输前 reset、传输后读 bytes，即得本次
 // 传输字节，无需累计差值（避免长跑累计值无界增长 / rcd 重启后基准失效等边界）。
 func (c *Client) ResetStatsGroup(ctx context.Context, group string) error {
-	return c.post(ctx, "/core/stats-reset", map[string]any{"group": group}, nil)
+	err := c.post(ctx, "/core/stats-reset", map[string]any{"group": group}, nil)
+	if err != nil && group != "" {
+		// rcd 的 stats group 仅在首次有传输写入 _group 时才创建。传输前 reset 一个尚未
+		// 建立的 group，core/stats-reset 返回 `group "<g>" not found`——此时计数本就是 0，
+		// 零态已达成，视作成功。仅精确匹配「该 group 的 not found」，其余错误（网络/认证/
+		// 参数/endpoint missing）照常传播，避免在未确认 reset 的状态下继续传输。
+		if strings.Contains(err.Error(), `group "`+group+`" not found`) {
+			return nil
+		}
+	}
+	return err
 }
 
 // SetBwLimit 运行时设 rcd 全局带宽限速。rate 形如 "100M"，"off" 解除。
