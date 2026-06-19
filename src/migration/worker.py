@@ -82,8 +82,11 @@ def parse_message_body(body: str) -> TransferMessage:
         raise ValueError("message body must be a JSON object")
 
     # op 缺省 = copy；非法值在 TransferMessage.from_body 里 Op(...) 抛 ValueError。
+    # 这里故意用原始字符串比较（不解析枚举）以保持边界容错——非法 op 留给 from_body
+    # 抛错，不在此处提前抛（否则改变 poison 语义）。
     op = data.get("op", "copy")
-    # copy 需 source+destination；delete 只删目标端，仅需 destination（source 可空）。
+    # 只有 delete 仅需 destination（删目标端）；其余所有 op（copy/refresh）都需 source+
+    # destination —— refresh 复用 copyto 传输路径，必须有 source。
     required = ("destination",) if op == "delete" else ("source", "destination")
     for field in required:
         # 类型混淆防御：缺失/非字符串/空值统一 ValueError → poison 链路（DDB 留终态）。

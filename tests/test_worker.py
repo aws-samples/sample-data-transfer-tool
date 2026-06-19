@@ -103,6 +103,36 @@ class TestParseMessageBody:
         with pytest.raises(ValueError):
             parse_message_body(body)
 
+    # ── op=refresh 分支：与 copy 一样必须有 source ──
+    def test_refresh_op_with_source_ok(self):
+        from migration.models import Op
+
+        body = json.dumps({
+            "op": "refresh",
+            "source": "gcs:eu-abc-dw/path/obj.bin",
+            "destination": "s3:datatos3-code/mig/obj.bin",
+        })
+        msg = parse_message_body(body)
+        assert msg.op is Op.REFRESH
+        assert msg.source == "gcs:eu-abc-dw/path/obj.bin"
+
+    def test_refresh_op_missing_source_raises(self):
+        # refresh 复用 copy 路径，必须有 source（不像 delete 可省）
+        with pytest.raises(ValueError):
+            parse_message_body(
+                json.dumps({"op": "refresh", "destination": "s3:datatos3-code/mig/x"})
+            )
+
+    def test_refresh_op_directory_source_is_poison(self):
+        # refresh 复用 copyto → 目录源（尾部 /）会触发整树复制（高爆炸半径），
+        # 必须在 parse 阶段按 poison 拒绝（与 copy 目录源同处理）。
+        with pytest.raises(ValueError):
+            parse_message_body(json.dumps({
+                "op": "refresh",
+                "source": "gcs:eu-abc-dw/warehouse/aml.db/dt=20250724/",
+                "destination": "s3:datatos3-code/warehouse/aml.db/dt=20250724/",
+            }))
+
     @pytest.mark.parametrize(
         "body_dict",
         [
@@ -426,6 +456,35 @@ class TestProcessMessageDirectoryPath:
         out, ran = self._process_body(body, spy)
         assert out.state is State.SUCCESS
         assert ran["called"] is True           # 正常对象不受影响
+
+    def test_refresh_op_flows_like_copy_end_to_end(self):
+        # 端到端：refresh 消息经 parse → run_fn 收到 Op.REFRESH（没被丢成 copy/阻断）
+        # → SUCCESS 走删消息 + 记终态 + 上报 op=refresh。这是 SQS 边界→runner 集成点。
+        from migration.models import Op
+        spy = _Spy()
+        seen = {}
+
+        def fake_run(msg, config_path, is_large_):
+            seen["op"] = msg.op
+            return _fake_run_result(State.SUCCESS)
+
+        body = json.dumps({
+            "op": "refresh",
+            "source": "gcs:eu-abc-dw/path/obj.bin",
+            "destination": "s3:datatos3-code/mig/obj.bin",
+        })
+        out = process_message(
+            body=body, object_size=1024, instance_id="i-test",
+            config_path="/tmp/c", region="r", status_table="t",
+            now_iso="2026-06-19T00:00:00",
+            run_fn=fake_run, delete_fn=spy.delete, record_fn=spy.record,
+            report_fn=spy.report, requeue_fn=spy.requeue,
+        )
+        assert seen["op"] is Op.REFRESH        # worker 没把 refresh 丢成 copy
+        assert out.state is State.SUCCESS
+        assert out.counted is True
+        assert spy.deleted is True             # SUCCESS → 删消息
+        assert spy.reported.get("op") == "refresh"  # 监控 event 带 op.value
 
 
 class TestResolveInstanceId:

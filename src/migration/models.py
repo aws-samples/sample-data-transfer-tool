@@ -11,12 +11,16 @@ from enum import Enum
 class Op(str, Enum):
     """消息操作类型。delete 用于"迁移后撤销/清理目标对象"。
 
-    - COPY:   rclone copyto，源 → 目标（默认，旧消息无 op 字段即此）
-    - DELETE: rclone deletefile，删目标端单个对象（destination）
+    - COPY:    rclone copyto，源 → 目标（默认，旧消息无 op 字段即此）
+    - DELETE:  rclone deletefile，删目标端单个对象（destination）
+    - REFRESH: rclone copyto --ignore-times，强制重传整个对象，使源端 metadata-only
+      变更（数据未变时 rclone 默认 skip）也刷新到目标。用于 CDC METADATA_UPDATE 场景。
+      与 COPY 一样必须带 source；代价 = 重传整个对象数据（非 metadata-only 轻量操作）。
     """
 
     COPY = "copy"
     DELETE = "delete"
+    REFRESH = "refresh"
 
 
 class State(str, Enum):

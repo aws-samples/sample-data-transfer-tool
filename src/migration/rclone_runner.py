@@ -194,8 +194,10 @@ def build_cmd(
 ) -> list[str]:
     """构建 rclone argv list（flags 在前，positional 在 -- 之后）。
 
-    op=DELETE → rclone deletefile destination（删目标端单对象，不传输）。
-    op=COPY   → rclone copyto source destination（默认）。
+    op=DELETE  → rclone deletefile destination（删目标端单对象，不传输）。
+    op=COPY    → rclone copyto source destination（默认）。
+    op=REFRESH → rclone copyto source destination --ignore-times（强制重传整对象，
+                 刷新源端 metadata-only 变更；复用 copy 的全部 flag 集）。
     bwlimit: 单进程带宽限速（字节/秒纯数字或 "off"=不限速），由 AIMD 控制面下发。
     tpslimit: 单进程请求频率限速（次/秒纯数字或 "off"=不限），由 SSM 手动下发。
     """
@@ -214,6 +216,9 @@ def build_cmd(
         "--config", config_path,
         *_UPLOAD_FLAGS,
         *_COMMON_FLAGS,
+        # op=refresh：忽略 size/mtime 强制重传，使源端 metadata-only 变更刷到目标
+        # （rclone -I/--ignore-times = "transfer all unconditionally"）。仅 REFRESH 拼。
+        *(["--ignore-times"] if msg.op is Op.REFRESH else []),
         # 动态限速：仅当控制面下发有限值时才拼（默认 off 不拼）。
         *_bwlimit_flags(bwlimit),
         # 请求频率限速：手动 SSM 下发有限值时才拼（默认 off 不拼）。
@@ -437,7 +442,7 @@ def run(
     # （DDB 记 body，走快速重投烧进 DLQ 留底），不再静默记 SUCCESS 删消息。
     if (
         state is State.SUCCESS
-        and msg.op is Op.COPY
+        and msg.op in (Op.COPY, Op.REFRESH)
         and stats.transfers == 0
         and error_classifier.is_nothing_to_transfer(stderr)
     ):

@@ -48,9 +48,21 @@ def test_op_invalid_value_raises():
         TransferMessage.from_body({"op": "purge", "destination": "s3:b"})
 
 
+def test_op_refresh_parsed_and_serialized():
+    # refresh：强制重传刷新 metadata（CDC），与 copy 一样必须带 source。
+    body = {"op": "refresh", "source": "s3src:a", "destination": "s3:b"}
+    msg = TransferMessage.from_body(body)
+    assert msg.op is Op.REFRESH
+    assert msg.source == "s3src:a"
+    out = msg.to_body()
+    # 非默认 op → 序列化时显式带 op（不能被省略，否则下游退化成 copy）
+    assert out["op"] == "refresh"
+
+
 def test_op_enum_is_str():
     assert Op.COPY == "copy"
     assert Op.DELETE.value == "delete"
+    assert Op.REFRESH == "refresh"
 
 
 def test_run_result_success_property():

@@ -81,6 +81,12 @@ class TestSanitize:
         out = sanitize_rclone_args(["--ignore-errors"])
         assert out == []
 
+    def test_drops_ignore_times_from_message_args(self):
+        # 安全：--ignore-times 只能由可信的 op=refresh 在 runner 内部注入，
+        # 绝不允许来自 SQS 消息的 rclone_args 传入（不在白名单 → 丢弃）。
+        # 否则任意 copy 消息可借 rclone_args 触发强制全量重传（语义绕过/放大攻击面）。
+        assert sanitize_rclone_args(["--ignore-times"]) == []
+
     def test_drops_non_whitelisted_but_keeps_following_whitelisted(self):
         out = sanitize_rclone_args(["--ignore-errors", "--progress"])
         assert out == ["--progress"]
@@ -285,6 +291,59 @@ class TestBuildCmd:
         with pytest.raises(ValueError):
             build_cmd(
                 msg(op=Op.DELETE, destination="dst/a.txt"),
+                "/cfg/rclone.conf", is_large=False,
+            )
+
+    # ── op=refresh：rclone copyto --ignore-times（强制重传刷新 metadata）──
+    def test_refresh_op_uses_copyto_subcommand(self):
+        from migration.models import Op
+
+        cmd = build_cmd(msg(op=Op.REFRESH), "/cfg/rclone.conf", is_large=False)
+        # refresh 复用 copyto 路径（不是 deletefile）
+        assert cmd[1] == "copyto"
+
+    def test_refresh_op_injects_ignore_times(self):
+        from migration.models import Op
+
+        cmd = build_cmd(msg(op=Op.REFRESH), "/cfg/rclone.conf", is_large=False)
+        assert "--ignore-times" in cmd
+        # 必须在 -- 终结符之前（属 flag 区，否则被当 positional）
+        assert cmd.index("--ignore-times") < cmd.index("--")
+
+    def test_copy_op_omits_ignore_times(self):
+        # 关键对照：默认 copy 不注入 --ignore-times（只有 refresh 才强制重传）
+        cmd = build_cmd(msg(), "/cfg/rclone.conf", is_large=False)
+        assert "--ignore-times" not in cmd
+
+    def test_copy_with_ignore_times_in_message_args_dropped(self):
+        # 安全回归：copy 消息即便在 rclone_args 里塞 --ignore-times，也被白名单丢弃，
+        # 不会进入最终命令（--ignore-times 只能由 op=refresh 注入，不可被消息绕过）。
+        cmd = build_cmd(
+            msg(args=("--ignore-times",)), "/cfg/rclone.conf", is_large=False,
+        )
+        assert "--ignore-times" not in cmd
+
+    def test_delete_op_omits_ignore_times(self):
+        from migration.models import Op
+
+        cmd = build_cmd(msg(op=Op.DELETE), "/cfg/rclone.conf", is_large=False)
+        assert "--ignore-times" not in cmd
+
+    def test_refresh_op_keeps_metadata_and_upload_flags(self):
+        # refresh 仍带完整 copy flag 集（--metadata 等），metadata 刷新才有意义
+        from migration.models import Op
+
+        cmd = build_cmd(msg(op=Op.REFRESH), "/cfg/rclone.conf", is_large=False)
+        assert "--metadata" in cmd
+        assert "--s3-upload-cutoff" in cmd
+
+    def test_refresh_op_validates_source(self):
+        # refresh 仍走 source 端点校验（缺 backend 前缀报错）
+        from migration.models import Op
+
+        with pytest.raises(ValueError):
+            build_cmd(
+                msg(op=Op.REFRESH, source="bucket/a.txt"),
                 "/cfg/rclone.conf", is_large=False,
             )
 
@@ -675,6 +734,36 @@ class TestRun:
         )
         runner = make_runner(returncode=0, stderr=b"")
         res = run(del_msg, "/cfg/rclone.conf", is_large=False, runner=runner)
+        assert res.state is State.SUCCESS
+
+    def test_refresh_nothing_to_transfer_downgraded_success_to_fatal(self):
+        # 关键回归（移植 refresh）：refresh 复用 copyto 路径，同样会撞"源不存在 →
+        # 退化父目录空同步 → exit 0 假成功"盲点。降级守卫必须放宽到含 REFRESH，
+        # 否则 refresh 撞不存在源被静默记 SUCCESS 删消息（数据完整性盲点）。
+        from migration.models import Op
+
+        stderr = (
+            b'{"time":"2026-06-10T07:02:31.30109992Z","level":"info",'
+            b'"msg":"There was nothing to transfer","source":"sync/sync.go:1019"}\n'
+            b'{"time":"2026-06-10T07:02:31.301227912Z","level":"notice",'
+            b'"msg":"...","stats":{"bytes":0,"elapsedTime":0.013,"errors":0,'
+            b'"transfers":0,"speed":0}}'
+        )
+        runner = make_runner(returncode=0, stderr=stderr)
+        res = run(msg(op=Op.REFRESH), "/cfg/rclone.conf", is_large=False, runner=runner)
+        assert res.state is State.FATAL
+        assert res.error_class == "src_not_found"
+
+    def test_refresh_real_transfer_stays_success(self):
+        # 对照：refresh 真实传输了对象（transfers>=1）→ 仍 SUCCESS，不被误降级。
+        from migration.models import Op
+
+        stderr = (
+            b'{"level":"notice","msg":"...","stats":{"bytes":100,"elapsedTime":0.5,'
+            b'"errors":0,"transfers":1,"speed":200}}'
+        )
+        runner = make_runner(returncode=0, stderr=stderr)
+        res = run(msg(op=Op.REFRESH), "/cfg/rclone.conf", is_large=False, runner=runner)
         assert res.state is State.SUCCESS
 
     def test_real_crash_stays_unknown(self):

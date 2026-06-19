@@ -365,13 +365,18 @@ aws cloudformation create-stack --region <region> \
 
 // 示例 4 — 删除目标对象（迁移后清理）
 { "op": "delete", "destination": "s3:dest-bucket/migrated/obj.bin" }
+
+// 示例 5 — 强制重传刷新 metadata（CDC METADATA_UPDATE；源端只改了 metadata 也重传）
+{ "op": "refresh",
+  "source": "gcs:my-bucket/path/obj.bin",
+  "destination": "s3:dest-bucket/migrated/path/obj.bin" }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `source` | String | copy ✅ / delete ❌ | rclone 源路径（`gcs:` 或 `s3:`） |
+| `source` | String | copy/refresh ✅ / delete ❌ | rclone 源路径（`gcs:` 或 `s3:`） |
 | `destination` | String | ✅ | rclone 目标路径（`s3:`）。桶名须落在 `TargetBucketPrefix` 范围内 |
-| `op` | String | ❌ | `copy`（默认可省，`rclone copyto`）/ `delete`（`rclone deletefile`） |
+| `op` | String | ❌ | `copy`（默认可省，`rclone copyto`）/ `delete`（`rclone deletefile`）/ `refresh`（`rclone copyto --ignore-times`，强制重传刷新 metadata，须带 source，代价=重传全量数据） |
 | `rclone_args` | Array | ❌ | 额外 rclone 参数（白名单过滤，拒绝含 `\0`/`\n`/`\r` 的值） |
 
 > **发送命令**：
@@ -390,9 +395,11 @@ aws cloudformation create-stack --region <region> \
 | 正常 copy（大/小文件） | SUCCESS | 大文件走 multipart |
 | `op=delete` 删已存在对象 | SUCCESS | 依赖 `s3:DeleteObject` 权限 |
 | `op=delete` 删不存在对象 | SUCCESS | 幂等（not-found 判成功，不进 DLQ） |
+| `op=refresh` 刷新已存在对象 | SUCCESS | 强制重传整对象（`--ignore-times`），单测覆盖 |
+| `op=refresh` 源对象不存在 | FATAL | 降级 `src_not_found` 进 DLQ（与 copy 同盲点防护，非静默 SUCCESS） |
 | 非法 JSON / 缺 `destination` | FATAL | 当 poison：DDB 记 `poison:<md5>`，删消息不卡队列 |
 | `rclone_args` 含非白名单 flag / 注入串 | SUCCESS | 非白名单参数（含 `; rm -rf /`）被静默丢弃，命令注入防御生效 |
-| copy 源对象不存在 | SUCCESS（0 字节） | ⚠️ rclone 对缺失单源退出 0。**上游须保证 source 真实存在** |
+| copy/refresh 源对象不存在 | FATAL | rclone 对缺失单源退出 0 + "nothing to transfer"，已降级 `src_not_found` 进 DLQ（非静默 SUCCESS）。**上游仍应保证 source 真实存在** |
 
 ### 四态语义（SQS 重试，刻意设计）
 
