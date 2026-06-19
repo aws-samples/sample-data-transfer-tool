@@ -8,19 +8,27 @@ import (
 )
 
 // GCS Pub/Sub 通知的 eventType（attribute 值，官方枚举）。
-// owner 决策 2026-06-15：只监控 FINALIZE + METADATA_UPDATE，两者都映射为 copy
-// （重新把该对象同步到 S3）；DELETE/ARCHIVE/INITIALIZE 暂不处理（跳过）。
+// owner 决策 2026-06-15：只监控 FINALIZE + METADATA_UPDATE；DELETE/ARCHIVE/INITIALIZE
+// 暂不处理（跳过）。两者的 op 不同（见下）：
+//   - FINALIZE（对象创建/新版本，数据变了）→ copy（rclone 按 size/mtime 正常同步）。
+//   - METADATA_UPDATE（只改 metadata、数据未变）→ refresh（rclone copyto --ignore-times
+//     强制重传）。若用普通 copy，rclone 会因 size/mtime 未变而 skip，metadata 永远刷不到
+//     S3 目标 —— 故必须用 worker 的 op=refresh 强制重传。
 const (
 	eventFinalize   = "OBJECT_FINALIZE"        // 对象创建/新版本 → copy
-	eventMetaUpdate = "OBJECT_METADATA_UPDATE" // 对象元数据更新 → copy（重新同步）
+	eventMetaUpdate = "OBJECT_METADATA_UPDATE" // 对象元数据更新 → refresh（强制重传刷新 metadata）
+
+	opRefresh = "refresh" // worker 契约的 op 值（copy 省略 op，refresh 显式带）
 )
 
 // migrationMessage 投递到 SQS 的迁移消息体，形态对齐 worker 契约
-// （models.TransferMessage：copy 省略 op；object_size 走 MessageAttribute，不在 body）。
-// 当前只产 copy（FINALIZE/METADATA_UPDATE），故不带 op 字段。
+// （models.TransferMessage：copy 省略 op；refresh 显式带 op；object_size 走
+// MessageAttribute，不在 body）。Op 用 omitempty：copy 时为空串 → JSON 省略该字段
+// （worker 的 Op(body.get("op","copy")) 据此默认 copy），refresh 时序列化出 "op":"refresh"。
 type migrationMessage struct {
-	Source      string `json:"source"`      // gcs:<bucket>/<key>
-	Destination string `json:"destination"` // s3:<destBucket>/<destPrefix>/<key>
+	Source      string `json:"source"`          // gcs:<bucket>/<key>
+	Destination string `json:"destination"`     // s3:<destBucket>/<destPrefix>/<key>
+	Op          string `json:"op,omitempty"`    // 空=copy（省略）；"refresh"=强制重传刷新 metadata
 }
 
 // mappedMessage 映射结果：SQS body + object_size 属性（仅 copy 有真实大小）。
@@ -76,6 +84,11 @@ func mapEvent(attrs map[string]string, payload []byte, dest Dest) (mappedMessage
 		msg := migrationMessage{
 			Source:      fmt.Sprintf("gcs:%s/%s", bucket, objectKey),
 			Destination: fmt.Sprintf("s3:%s/%s", s3Dest, destKey),
+		}
+		// METADATA_UPDATE：数据未变只改 metadata → op=refresh 强制重传（否则 rclone skip）。
+		// FINALIZE：数据变了 → copy（Op 留空，JSON 省略 op 字段）。
+		if eventType == eventMetaUpdate {
+			msg.Op = opRefresh
 		}
 		body, _ := json.Marshal(msg)
 		return mappedMessage{Body: string(body), Bucket: bucket, ObjectSize: size}, nil

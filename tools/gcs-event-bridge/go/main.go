@@ -102,9 +102,11 @@ func runPipeline(ctx context.Context, p Pipeline, sm smGetter, sqsClient sqsSend
 	}
 
 	// 2. 建 Pub/Sub client（用 SA key 认证）。
-	projectID := p.Source.ProjectID
-	if projectID == "" {
-		projectID = projectFromSubscription(p.Source.Subscription)
+	// project id：显式 project_id 优先；缺省从订阅完整路径解析；都拿不到则 fail-fast
+	// （否则空 projectID 传给 pubsub.NewClient 会得到不直观的下游错误）。
+	projectID, err := resolveProjectID(p.Source.ProjectID, p.Source.Subscription)
+	if err != nil {
+		return err
 	}
 	psClient, err := pubsub.NewClient(ctx, projectID, option.WithCredentialsJSON(saJSON))
 	if err != nil {
@@ -191,6 +193,7 @@ func fetchSAKey(ctx context.Context, sm smGetter, arn string) ([]byte, error) {
 }
 
 // projectFromSubscription 从 projects/<proj>/subscriptions/<sub> 解析 project id。
+// 短订阅名（无 projects/ 前缀）解析不出，返回空串。
 func projectFromSubscription(full string) string {
 	parts := strings.Split(full, "/")
 	if len(parts) >= 2 && parts[0] == "projects" {
@@ -199,10 +202,16 @@ func projectFromSubscription(full string) string {
 	return ""
 }
 
-// subscriptionID 取订阅短 id（pubsub.Subscription 要短名，不要完整路径）。
-func subscriptionID(full string) string {
-	parts := strings.Split(full, "/")
-	return parts[len(parts)-1]
+// resolveProjectID 定 GCP project id：显式 explicitID 优先；为空则从订阅完整路径解析；
+// 两者都拿不到 → fail-fast 报错（不把空 projectID 传给 pubsub.NewClient 得不直观的下游错误）。
+func resolveProjectID(explicitID, subscription string) (string, error) {
+	if explicitID != "" {
+		return explicitID, nil
+	}
+	if id := projectFromSubscription(subscription); id != "" {
+		return id, nil
+	}
+	return "", fmt.Errorf("无法确定 GCP project id：subscription %q 非完整路径（projects/<proj>/subscriptions/<sub>），请在配置显式填 project_id", subscription)
 }
 
 func progressLoop(name string, st *bridgeStats, stop <-chan struct{}) {
@@ -237,10 +246,13 @@ func logFinal(name string, st *bridgeStats) {
 	logStats(name, "汇总", st)
 }
 
-// dualWriter 日志同时写控制台和文件。
+// dualWriter 日志同时写控制台和文件。任一写失败都返回错误（按 io.Writer 契约，
+// 不静默吞——文件落盘失败时尤其要让 log 包感知，避免以为日志已持久化）。
 type dualWriter struct{ console, file *os.File }
 
 func (w *dualWriter) Write(p []byte) (int, error) {
-	w.console.Write(p)
+	if n, err := w.console.Write(p); err != nil {
+		return n, err
+	}
 	return w.file.Write(p)
 }

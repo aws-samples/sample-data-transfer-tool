@@ -114,8 +114,41 @@ func TestProjectFromSubscription(t *testing.T) {
 	if got := projectFromSubscription("projects/my-proj/subscriptions/sub"); got != "my-proj" {
 		t.Errorf("got %q want my-proj", got)
 	}
-	if got := subscriptionID("projects/my-proj/subscriptions/sub-x"); got != "sub-x" {
-		t.Errorf("got %q want sub-x", got)
+	// 短订阅名（无 projects/ 前缀）→ 解析不出 project，返回空。
+	// runPipeline 会据此 fail-fast（除非配置显式填了 project_id）。
+	if got := projectFromSubscription("sub-only"); got != "" {
+		t.Errorf("短订阅名应解析为空 project，got %q", got)
+	}
+}
+
+func TestResolveProjectID(t *testing.T) {
+	// fail-fast 不误杀：显式 project_id 优先；只有它空且从 subscription 也解析不出才报错。
+	cases := []struct {
+		name       string
+		explicitID string
+		sub        string
+		want       string
+		wantErr    bool
+	}{
+		{"显式 project_id + 短订阅", "my-proj", "sub-only", "my-proj", false},
+		{"无 project_id + 完整订阅路径", "", "projects/p2/subscriptions/s", "p2", false},
+		{"显式 project_id + 完整路径(显式优先)", "explicit", "projects/p2/subscriptions/s", "explicit", false},
+		{"都解析不出 → 报错", "", "sub-only", "", true},
+	}
+	for _, c := range cases {
+		got, err := resolveProjectID(c.explicitID, c.sub)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%s: 应报错但没有", c.name)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: 不应报错: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
 	}
 }
 

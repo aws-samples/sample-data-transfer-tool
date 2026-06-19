@@ -88,6 +88,20 @@ func TestSendBatchObjectSizeAttribute(t *testing.T) {
 	}
 }
 
+func TestSendBatchRefreshKeepsObjectSize(t *testing.T) {
+	// refresh 是 copy 路径，worker 大小路由仍需 object_size —— 不能因 op=refresh 丢 size。
+	f := &fakeSender{}
+	st := &bridgeStats{}
+	var a, n int64
+	batch := []inboundMessage{
+		mkInbound(`{"op":"refresh","source":"gcs:b/k","destination":"s3:d/k"}`, 4096, &a, &n),
+	}
+	sendBatch(context.Background(), f, "q", batch, st)
+	if f.gotAttrs[0]["object_size"].StringValue == nil || *f.gotAttrs[0]["object_size"].StringValue != "4096" {
+		t.Errorf("refresh 消息应仍带 object_size=4096 属性")
+	}
+}
+
 func TestSendBatchNacksWholeOnError(t *testing.T) {
 	f := &fakeSender{failAll: true}
 	st := &bridgeStats{}

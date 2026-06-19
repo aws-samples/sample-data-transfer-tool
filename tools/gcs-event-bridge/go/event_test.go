@@ -43,6 +43,17 @@ func mustMsg(t *testing.T, body string) migrationMessage {
 	return m
 }
 
+// rawKeys 把 body 解到 map，用于断言「op 字段是否存在」——
+// 仅 unmarshal 到 struct 时 {"op":""} 和无 op 都得空串，区分不出会 poison worker 的错。
+func rawKeys(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		t.Fatalf("body 不是合法 JSON: %v", err)
+	}
+	return m
+}
+
 // ── 写法 A：整桶映射 ──────────────────────────────────────────────
 func TestMapFinalizePlainBucket(t *testing.T) {
 	attrs := map[string]string{"eventType": eventFinalize, "bucketId": "ssmp-gts-euprd-bucket",
@@ -75,15 +86,45 @@ func TestMapPlainBucketWithPrefix(t *testing.T) {
 	}
 }
 
-func TestMapMetadataUpdateAlsoCopy(t *testing.T) {
+func TestMapMetadataUpdateIsRefresh(t *testing.T) {
+	// METADATA_UPDATE = 源端只改 metadata、数据未变 → 必须 op=refresh（rclone copyto
+	// --ignore-times 强制重传），否则普通 copy 被 rclone 按 size/mtime skip，metadata 刷不到目标。
 	attrs := map[string]string{"eventType": eventMetaUpdate, "bucketId": "ssmp-gts-euprd-bucket", "objectId": "k.bin"}
 	got, _ := mapEvent(attrs, []byte(`{"size":"5"}`), testDest)
 	if got.skip || got.unknownBkt {
-		t.Fatal("METADATA_UPDATE 应映射为 copy")
+		t.Fatal("METADATA_UPDATE 应映射为 refresh（非 skip）")
 	}
 	m := mustMsg(t, got.Body)
+	if m.Op != "refresh" {
+		t.Errorf("METADATA_UPDATE 的 op 应为 refresh，got %q", m.Op)
+	}
+	if m.Source != "gcs:ssmp-gts-euprd-bucket/k.bin" {
+		t.Errorf("source=%q（refresh 必须带 source）", m.Source)
+	}
 	if m.Destination != "s3:s3euprodgtseuprdbucket/k.bin" {
 		t.Errorf("destination=%q", m.Destination)
+	}
+	// raw JSON 必须含 op key（worker 据此判 refresh；缺则退化成 copy → metadata 刷不到）
+	if _, ok := rawKeys(t, got.Body)["op"]; !ok {
+		t.Error("refresh body 的 raw JSON 必须含 op key")
+	}
+	// refresh 是 copy 路径，size 不能丢（worker 大小路由需要）
+	if got.ObjectSize != 5 {
+		t.Errorf("refresh 应保留 ObjectSize，got %d", got.ObjectSize)
+	}
+}
+
+func TestMapFinalizeOmitsOpKey(t *testing.T) {
+	// 对照：FINALIZE → copy，body 的 raw JSON 必须【不含】op key（omitempty）。
+	// 否则 copy 误带 op="" 会让 worker 的 Op("") 解析异常。
+	attrs := map[string]string{"eventType": eventFinalize, "bucketId": "ssmp-gts-euprd-bucket", "objectId": "k.bin"}
+	got, _ := mapEvent(attrs, []byte(`{"size":"5"}`), testDest)
+	m := mustMsg(t, got.Body)
+	if m.Op != "" {
+		t.Errorf("FINALIZE 的 op 应为空（copy），got %q", m.Op)
+	}
+	if _, ok := rawKeys(t, got.Body)["op"]; ok {
+		t.Error("copy body 的 raw JSON 不应含 op key（omitempty 省略）")
 	}
 }
 
