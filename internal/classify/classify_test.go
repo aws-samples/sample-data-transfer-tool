@@ -93,9 +93,6 @@ func TestTransientAndTerminalHelpers(t *testing.T) {
 	if !IsSourceMissing("Source doesn't exist or is a directory") {
 		t.Error("source missing 应识别")
 	}
-	if !IsNothingToTransfer("There was nothing to transfer") {
-		t.Error("nothing to transfer 应识别")
-	}
 	if !IsDeleteNoop("404 not found") {
 		t.Error("delete noop 404 应识别")
 	}

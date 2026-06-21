@@ -46,9 +46,6 @@ var transientError = regexp.MustCompile(
 // sourceMissing 源对象不存在（确定性终态，重试无用）。要求 "source" 紧邻 "doesn't exist"。
 var sourceMissing = regexp.MustCompile(`(?i)source\s+(doesn'?t|does\s+not)\s+exist`)
 
-// nothingToTransfer 源不存在的 exit-0 假成功标记。
-var nothingToTransfer = regexp.MustCompile(`(?i)there was nothing to transfer`)
-
 // deleteNoop delete 操作目标已不存在（幂等成功）。
 var deleteNoop = regexp.MustCompile(`(?i)\b404\b|not\s*found|does not exist|no such`)
 
@@ -100,9 +97,6 @@ func IsTransientError(stderr string) bool { return transientError.MatchString(st
 
 // IsSourceMissing 是否"源对象不存在"（确定性终态，UNKNOWN → FATAL 升级）。
 func IsSourceMissing(stderr string) bool { return sourceMissing.MatchString(stderr) }
-
-// IsNothingToTransfer 是否 rclone "无可传输"假成功标记。
-func IsNothingToTransfer(stderr string) bool { return nothingToTransfer.MatchString(stderr) }
 
 // IsDeleteNoop delete 路径目标已不存在（幂等成功）。
 func IsDeleteNoop(stderr string) bool { return deleteNoop.MatchString(stderr) }
