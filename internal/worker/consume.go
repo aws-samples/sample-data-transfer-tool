@@ -57,10 +57,8 @@ type Consumer struct {
 	report     func(EMFEvent)
 	stats      *Stats
 
-	inflight      sync.Map     // receipt -> struct{}，停机时批量重置 visibility=0
-	inflightCount atomic.Int64 // 已从 SQS 收到且尚未完成 delete/requeue 的消息数
-	active        atomic.Int64 // 正在 worker goroutine 内处理的消息数
-	progress      atomic.Int64 // receiver/liveness 推进计数，watchdog 判活
+	inflight sync.Map     // receipt -> struct{}，停机时批量重置 visibility=0
+	progress atomic.Int64 // receiver 循环推进计数，watchdog 轮询活性信号
 }
 
 type queuedMessage struct {
@@ -69,14 +67,14 @@ type queuedMessage struct {
 }
 
 const (
-	maxReceiveBatch       = 10
-	sqsSideEffectTimeout  = 10 * time.Second
-	watchdogProgressEvery = 15 * time.Second
-	maxVisibilitySeconds  = 43200
+	maxReceiveBatch      = 10
+	sqsSideEffectTimeout = 10 * time.Second
+	maxVisibilitySeconds = 43200
 )
 
-// Progress 返回 receiver 循环推进计数。空闲（长轮询空返）也推进，故只有真卡死才不增，
-// watchdog 据此区分"空闲"与"僵死"，避免误杀空闲机。
+// Progress 返回 receiver 循环推进计数（空闲长轮询空返也推进）。这是 watchdog 的"轮询活性"
+// 信号:覆盖队列空闲不被误杀。但所有 worker 占满、在传大文件时 receiver 阻塞在 acquireSlots,
+// 轮询活性会冻结——此时 watchdog 靠 rcd 全局字节活性兜底(见 internal/watchdog)。
 func (c *Consumer) Progress() int64 { return c.progress.Load() }
 
 // Recorder 抽象 DDB 终态写入（便于测试注入 fake）。status.Store 实现它。
@@ -133,8 +131,6 @@ func (c *Consumer) Run(ctx context.Context) {
 			c.receiveLoop(ctx, jobCh, slots)
 		}()
 	}
-	go c.livenessLoop(ctx)
-
 	recvWG.Wait() // ctx 取消后 receiver 退出
 	close(jobCh)  // 不再有新消息
 	workerWG.Wait()
@@ -228,36 +224,16 @@ func (c *Consumer) releaseSlots(slots chan<- struct{}, n int) {
 
 func (c *Consumer) registerInflight(receipt string) {
 	c.inflight.Store(receipt, struct{}{})
-	c.inflightCount.Add(1)
 }
 
 func (c *Consumer) finishInflight(receipt string) {
-	if _, ok := c.inflight.LoadAndDelete(receipt); ok {
-		c.inflightCount.Add(-1)
-	}
-}
-
-func (c *Consumer) livenessLoop(ctx context.Context) {
-	t := time.NewTicker(watchdogProgressEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if c.active.Load() > 0 || c.inflightCount.Load() > 0 {
-				c.progress.Add(1)
-			}
-		}
-	}
+	c.inflight.LoadAndDelete(receipt)
 }
 
 // handle 处理单条消息：登记 in-flight → ProcessMessage(注入副作用) → 移除 in-flight。
 func (c *Consumer) handle(ctx context.Context, qm queuedMessage) {
 	m := qm.msg
 	receipt := qm.receipt
-	c.active.Add(1)
-	defer c.active.Add(-1)
 	defer c.finishInflight(receipt)
 
 	size := parseObjectSize(m)

@@ -75,9 +75,12 @@ func TestCopyFile_BusinessError(t *testing.T) {
 	if err == nil {
 		t.Fatal("rc 失败应返回 error")
 	}
-	// 错误文本应回传 rcd 的 error 字段（供四态分类）
-	if err.Error() != "StatusCode: 429 too many requests" {
+	// 错误文本应回传 rcd 的 error 字段（供四态分类，含 429 token）并带上 path（排障定位）。
+	if !strings.Contains(err.Error(), "StatusCode: 429 too many requests") {
 		t.Errorf("应回传 rcd error 文本，got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "/operations/copyfile") {
+		t.Errorf("错误应带 rc path 上下文，got %q", err.Error())
 	}
 }
 
@@ -98,6 +101,30 @@ func TestDeleteFile_Sync(t *testing.T) {
 	}
 	if !called {
 		t.Error("deletefile 未被调用")
+	}
+}
+
+func TestGlobalStats_NoGroupShortPayload(t *testing.T) {
+	srv := newFakeRCD(t, func(path string, body map[string]any) (int, any) {
+		if path != "/core/stats" {
+			t.Errorf("应调 core/stats，got %s", path)
+		}
+		// 全局活性探测：不带 group，带 short=true（省略大数组）。
+		if _, hasGroup := body["group"]; hasGroup {
+			t.Errorf("GlobalStats 不应带 group，got %v", body["group"])
+		}
+		if body["short"] != true {
+			t.Errorf("GlobalStats 应带 short=true，got %v", body["short"])
+		}
+		return 200, map[string]any{"bytes": 12345, "transfers": 7, "errors": 1}
+	})
+	defer srv.Close()
+	gs, err := clientFor(srv).GlobalStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gs.Bytes != 12345 || gs.Transfers != 7 || gs.Errors != 1 {
+		t.Errorf("全局 stats 解析错: %+v", gs)
 	}
 }
 

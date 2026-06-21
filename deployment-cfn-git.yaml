@@ -572,7 +572,9 @@ Resources:
                   # 日志双流：EMF→stdout→worker-emf log（CW 抽取指标）；分级运维日志（WARNING+）
                   # → OPS_LOG_PATH=worker-ops-0.log（CW 采集 worker-ops 组，失败/poison 不登机可查）。
                   # watchdog：Type=notify + WatchdogSec=120 —— go-worker 周期 sd_notify(WATCHDOG=1)，
-                  # 僵死（receiver 不推进）则停报 → systemd 120s 超时杀进程重启（在途消息靠 SQS 重投）。
+                  # 僵死（轮询与 rcd 传输字节连续多轮均不推进）则停报 → systemd 120s 超时重启。
+                  # WatchdogSignal=SIGTERM：watchdog 超时走与正常停机相同的 SIGTERM 路径（默认 SIGABRT
+                  # 不经 go-worker 信号处理 → 跳过优雅 drain，在途消息要等满 visibility 才重投）。
                   cat > /etc/systemd/system/go-worker.service <<EOF
                   [Unit]
                   Description=go-worker (rcd-based SQS migration consumer)
@@ -581,6 +583,7 @@ Resources:
                   [Service]
                   Type=notify
                   WatchdogSec=120
+                  WatchdogSignal=SIGTERM
                   User=root
                   EnvironmentFile=/etc/migration-rcd-pass
                   Environment="AWS_REGION=${AWS::Region}"

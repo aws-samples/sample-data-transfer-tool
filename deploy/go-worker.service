@@ -5,7 +5,14 @@ Requires=rclone-rcd.service
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec：go-worker 周期 sd_notify(WATCHDOG=1)，僵死（轮询与 rcd 传输
+# 字节连续多轮均不推进）则停报 → systemd 超时杀进程重启（在途消息靠 SQS 重投）。
+# 必须与 CFN 模板一致,否则 Type=simple 下 watchdog 不生效。
+Type=notify
+WatchdogSec=120
+# WatchdogSignal=SIGTERM：watchdog 超时走与正常停机相同的 SIGTERM 路径（默认 SIGABRT 不经
+# go-worker 信号处理 → 跳过优雅 drain，在途消息要等满 visibility 才重投）。
+WatchdogSignal=SIGTERM
 # go-worker 启动时探 rc/noop 就绪才消费（rcd 先起）。单进程多 goroutine：
 # WORKER_GOROUTINES 个 worker + RECEIVER_GOROUTINES 个 receiver，SQS in-flight 受 worker slots 限制。
 # ⚠️ WORKER_GOROUTINES 必须等于 rcd 的 --transfers（RCLONE_TRANSFERS），否则提交多于

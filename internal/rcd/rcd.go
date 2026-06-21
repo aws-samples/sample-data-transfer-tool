@@ -105,6 +105,15 @@ func (c *Client) StatsByGroup(ctx context.Context, group string) (GroupStats, er
 	return s, err
 }
 
+// GlobalStats 查 core/stats 全局汇总（不带 group → 所有 group 累计）。short=true
+// 让 rcd 省略 transferring/checking 等大数组，只回标量计数，足够做"传输是否在推进"
+// 的活性信号。供 watchdog 在所有 worker 饱和传大文件、长时间不完成单条消息时仍能判活。
+func (c *Client) GlobalStats(ctx context.Context) (GroupStats, error) {
+	var s GroupStats
+	err := c.post(ctx, "/core/stats", map[string]any{"short": true}, &s)
+	return s, err
+}
+
 // ResetStatsGroup 清零指定 group 的计数（core/stats-reset {group}）。仅清 bytes/transfers
 // 等计数与 startedTransfers，**不删除 group 的 StatsInfo 对象**（对象在 runner 的 group 池
 // 里长期复用，不重新引入 per-call StatsInfo 泄漏）。传输前 reset、传输后读 bytes，即得本次
@@ -168,10 +177,11 @@ func (c *Client) post(ctx context.Context, path string, payload any, out any) er
 		return fmt.Errorf("读取 %s 响应: %w", path, readErr)
 	}
 	if resp.StatusCode != http.StatusOK {
-		// rc 业务失败：优先回传 rcd 的 error 文本（供四态分类）。
+		// rc 业务失败：优先回传 rcd 的 error 文本（供四态分类，文本含 404/429/5xx 等关键 token）
+		// 并带上 path，排障时能分清错误来自哪个 rc 调用（copyfile/deletefile/stats/...）。
 		var re rcError
 		if json.Unmarshal(body, &re) == nil && re.Error != "" {
-			return fmt.Errorf("%s", re.Error)
+			return fmt.Errorf("rc %s 业务错误: %s", path, re.Error)
 		}
 		if truncated {
 			return fmt.Errorf("rc %s 返回 %d: %s...(truncated)", path, resp.StatusCode, truncate(body, 512))
