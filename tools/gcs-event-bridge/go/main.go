@@ -18,6 +18,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -31,21 +32,30 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"google.golang.org/api/option"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 func main() {
 	cfgPath := flag.String("config", "", "配置文件路径（YAML）")
-	logFile := flag.String("log-file", "", "日志落盘路径（同时输出控制台）")
+	logFile := flag.String("log-file", "", "日志落盘路径（同时输出控制台），自动按大小轮转并删除过期日志")
+	logMaxSizeMB := flag.Int("log-max-size-mb", 100, "单个日志文件最大 MB，超过即切割轮转")
+	logMaxBackups := flag.Int("log-max-backups", 7, "保留的轮转旧日志份数（超出最旧的删除）")
+	logMaxAgeDays := flag.Int("log-max-age-days", 14, "轮转旧日志最长保留天数（超过删除）")
+	logCompress := flag.Bool("log-compress", true, "轮转的旧日志是否 gzip 压缩")
 	flag.Parse()
 
 	if *logFile != "" {
-		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "打不开日志文件: %v\n", err)
-			os.Exit(1)
+		// lumberjack 按大小切割 + 保留份数/天数自动删旧日志（生产级轮转，避免撑爆磁盘）。
+		// 同时写 stderr（journald/控制台可见）与轮转文件。
+		lj := &lumberjack.Logger{
+			Filename:   *logFile,
+			MaxSize:    *logMaxSizeMB,
+			MaxBackups: *logMaxBackups,
+			MaxAge:     *logMaxAgeDays,
+			Compress:   *logCompress,
 		}
-		defer f.Close()
-		log.SetOutput(&dualWriter{os.Stderr, f})
+		defer lj.Close()
+		log.SetOutput(io.MultiWriter(os.Stderr, lj))
 	}
 	if *cfgPath == "" {
 		fmt.Fprintln(os.Stderr, "必须指定 --config")
@@ -170,9 +180,9 @@ func handleMessage(m *pubsub.Message, dest Dest, st *bridgeStats, inCh chan<- in
 	}
 	if mapped.unknownBkt {
 		// 源桶不在映射表（或前缀无命中且无兜底）：ack 丢弃 + 单独计数告警。
-		// 限流打日志，防未配桶大量事件刷爆磁盘；总量看进度行的 unknownBkt 计数。
+		// 每条都输出（不限流），便于排查哪些 key 未配映射；磁盘占用由 --log-file 轮转兜底。
 		st.bump(bucket, cUnknownBkt)
-		throttledErrLog(st, "未映射的源桶事件已跳过（最近一次）: %s", mapped.unknownInfo)
+		log.Printf("未映射的源桶事件已跳过: %s", mapped.unknownInfo)
 		m.Ack()
 		return
 	}
@@ -244,15 +254,4 @@ func logStats(name, tag string, st *bridgeStats) {
 
 func logFinal(name string, st *bridgeStats) {
 	logStats(name, "汇总", st)
-}
-
-// dualWriter 日志同时写控制台和文件。任一写失败都返回错误（按 io.Writer 契约，
-// 不静默吞——文件落盘失败时尤其要让 log 包感知，避免以为日志已持久化）。
-type dualWriter struct{ console, file *os.File }
-
-func (w *dualWriter) Write(p []byte) (int, error) {
-	if n, err := w.console.Write(p); err != nil {
-		return n, err
-	}
-	return w.file.Write(p)
 }
