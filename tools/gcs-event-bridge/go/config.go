@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"regexp"
 
 	"gopkg.in/yaml.v3"
 )
@@ -60,13 +61,20 @@ type BucketRule struct {
 	DefaultS3Bucket string `yaml:"default_s3_bucket"`
 }
 
-// PrefixRoute 写法 B 的一条前缀路由：对象 key 以 Prefix 开头 → 投到 S3Bucket。
-// StripPrefix=true 时，目标 key 剥掉匹配的 Prefix 段（如 mallfile-gcp 的
+// PrefixRoute 写法 B 的一条路由：对象 key 命中 → 投到 S3Bucket。
+//   - Prefix（字面前缀，HasPrefix）：key 以 Prefix 开头即命中。
+//   - Regex（正则）：Prefix 留空时改用正则匹配 key（如 ^[^/]+$ 根目录文件、
+//     ^[0-9]{8}/ 日期目录）。Prefix 与 Regex 二选一，不能同配。
+// 匹配顺序见 resolveDest：先字面前缀（最长优先），再 regex（按配置顺序）。
+// StripPrefix=true 仅对字面 Prefix 生效：剥掉匹配的 Prefix 段（如 mallfile-gcp 的
 // gcsprodorms/a/b → s3euprodorms/a/b）；默认 false 保留完整 key（层级不变）。
 type PrefixRoute struct {
 	Prefix      string `yaml:"prefix"`
+	Regex       string `yaml:"regex"`
 	S3Bucket    string `yaml:"s3_bucket"`
 	StripPrefix bool   `yaml:"strip_prefix"`
+
+	re *regexp.Regexp // Regex 编译结果（loadConfig 内填充，不入 YAML）
 }
 
 // isPrefixRouted 该规则是否走"按 key 前缀路由"（写法 B）。
@@ -108,9 +116,23 @@ func loadConfig(path string) (*Config, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	// 填充每条 pipeline 的调优默认值。
+	// 填充每条 pipeline 的调优默认值 + 编译 regex 路由（坏正则 fail-fast）。
 	for i := range cfg.Pipelines {
 		cfg.Pipelines[i].Tuning = cfg.Pipelines[i].Tuning.withDefaults()
+		for _, rule := range cfg.Pipelines[i].Dest.BucketMapping {
+			for j := range rule.PrefixRoutes {
+				pr := &rule.PrefixRoutes[j]
+				if pr.Regex == "" {
+					continue
+				}
+				re, err := regexp.Compile(pr.Regex)
+				if err != nil {
+					return nil, fmt.Errorf("pipeline %q prefix_routes regex %q 编译失败: %w",
+						cfg.Pipelines[i].Name, pr.Regex, err)
+				}
+				pr.re = re
+			}
+		}
 	}
 	return &cfg, nil
 }
@@ -166,8 +188,17 @@ func validateRule(pipeline, gcsBucket string, r BucketRule) error {
 			pipeline, gcsBucket)
 	case hasB:
 		for i, pr := range r.PrefixRoutes {
-			if pr.Prefix == "" {
-				return fmt.Errorf("pipeline %q 桶 %q prefix_routes[%d]: prefix 必填", pipeline, gcsBucket, i)
+			hasPrefix := pr.Prefix != ""
+			hasRegex := pr.Regex != ""
+			if hasPrefix && hasRegex {
+				return fmt.Errorf("pipeline %q 桶 %q prefix_routes[%d]: prefix 与 regex 不能同配（二选一）", pipeline, gcsBucket, i)
+			}
+			if !hasPrefix && !hasRegex {
+				return fmt.Errorf("pipeline %q 桶 %q prefix_routes[%d]: 必须配 prefix 或 regex", pipeline, gcsBucket, i)
+			}
+			// strip_prefix 只对字面 prefix 有意义；配在 regex 路由上会被静默忽略 → fail-fast 防误配。
+			if hasRegex && pr.StripPrefix {
+				return fmt.Errorf("pipeline %q 桶 %q prefix_routes[%d]: strip_prefix 不能用于 regex 路由（regex 保留完整 key）", pipeline, gcsBucket, i)
 			}
 			if pr.S3Bucket == "" {
 				return fmt.Errorf("pipeline %q 桶 %q prefix_routes[%d]: s3_bucket 必填", pipeline, gcsBucket, i)

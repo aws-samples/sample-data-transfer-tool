@@ -65,6 +65,14 @@ pipelines: [{name: a, source: {subscription: s, sa_secret_arn: x}, dest: {queue_
 pipelines: [{name: a, source: {subscription: s, sa_secret_arn: x}, dest: {queue_url: q, bucket_mapping: {b1: {}}}}]`,
 		"prefix_route 缺 s3_bucket": `region: r
 pipelines: [{name: a, source: {subscription: s, sa_secret_arn: x}, dest: {queue_url: q, bucket_mapping: {b1: {prefix_routes: [{prefix: "x/"}]}}}}]`,
+		"prefix+regex 同配": `region: r
+pipelines: [{name: a, source: {subscription: s, sa_secret_arn: x}, dest: {queue_url: q, bucket_mapping: {b1: {prefix_routes: [{prefix: "x/", regex: "^y", s3_bucket: s}]}}}}]`,
+		"route 既无 prefix 也无 regex": `region: r
+pipelines: [{name: a, source: {subscription: s, sa_secret_arn: x}, dest: {queue_url: q, bucket_mapping: {b1: {prefix_routes: [{s3_bucket: s}]}}}}]`,
+		"regex 路由误配 strip_prefix": `region: r
+pipelines: [{name: a, source: {subscription: s, sa_secret_arn: x}, dest: {queue_url: q, bucket_mapping: {b1: {prefix_routes: [{regex: "^x", s3_bucket: s, strip_prefix: true}]}}}}]`,
+		"坏 regex fail-fast": `region: r
+pipelines: [{name: a, source: {subscription: s, sa_secret_arn: x}, dest: {queue_url: q, bucket_mapping: {b1: {prefix_routes: [{regex: "[invalid(", s3_bucket: s}]}}}}]`,
 	}
 	for name, body := range cases {
 		if _, err := loadConfig(writeCfg(t, body)); err == nil {

@@ -2,8 +2,21 @@ package main
 
 import (
 	"encoding/json"
+	"regexp"
 	"testing"
 )
+
+// compileTestRegexes 编译 testDest 里 regex 路由的 re 字段（真实路径由 loadConfig 完成；
+// 单测直接构造 Dest，需手动编译以模拟运行时）。
+func init() {
+	for _, rule := range testDest.BucketMapping {
+		for j := range rule.PrefixRoutes {
+			if pr := &rule.PrefixRoutes[j]; pr.Regex != "" {
+				pr.re = regexp.MustCompile(pr.Regex)
+			}
+		}
+	}
+}
 
 // 测试用映射表：普通桶（写法 A）+ 带 prefix 的普通桶 + 前缀路由桶（写法 B）。
 var testDest = Dest{
@@ -22,6 +35,17 @@ var testDest = Dest{
 		"no-default-bucket": {
 			PrefixRoutes: []PrefixRoute{{Prefix: "x/", S3Bucket: "s3-x"}},
 			// 无 default：未命中前缀 → 未知桶跳过
+		},
+		// tmseu 风格：字面前缀 + regex 兜底（根文件/日期目录），无 default → 其余 skip。
+		"tmseu-style": {
+			PrefixRoutes: []PrefixRoute{
+				{Prefix: "lods/", S3Bucket: "s3-lods"},
+				{Prefix: "label", S3Bucket: "s3-lrms"},          // 无斜杠前缀
+				{Prefix: "no_shippingno_", S3Bucket: "s3-lrms"}, // 无斜杠前缀
+				{Regex: `^[^/]+$`, S3Bucket: "s3-lods"},         // 根目录文件（无子目录）
+				{Regex: `^[0-9]{8}/`, S3Bucket: "s3-lods"},      // {yyyyMMdd}/ 日期目录（恰好 8 位）
+			},
+			// 无 default_s3_bucket：未命中任何 prefix/regex → skip 不传输
 		},
 		// mallfile-gcp 风格：strip_prefix 剥掉匹配前缀段 + 兜底
 		"mallfile-gcp": {
@@ -196,6 +220,57 @@ func TestPrefixRouteNoMatchNoDefault(t *testing.T) {
 	got, _ := mapEvent(attrs, nil, testDest)
 	if !got.unknownBkt {
 		t.Fatalf("无 default 不命中应判 unknownBkt，got %+v", got)
+	}
+}
+
+// ── 写法 B + regex 兜底（tmseu 风格）─────────────────────────────
+// 路由优先级：字面 prefix（最长优先）> regex（按序）> 无 default 则 skip。
+func TestRegexRouteFallback(t *testing.T) {
+	cases := []struct {
+		name     string
+		key      string
+		wantDest string // 空串 = 期望 skip(unknownBkt)
+	}{
+		// 字面前缀命中（优先于 regex）
+		{"命中 lods/ 前缀", "lods/a/b.dat", "s3:s3-lods/lods/a/b.dat"},
+		{"命中 label 无斜杠前缀", "label_001.png", "s3:s3-lrms/label_001.png"},
+		{"命中 no_shippingno_ 前缀", "no_shippingno_x", "s3:s3-lrms/no_shippingno_x"},
+		// regex 兜底：根目录文件（无 /）
+		{"根目录普通文件 → lods", "report.csv", "s3:s3-lods/report.csv"},
+		{"根目录无扩展名 → lods", "abc", "s3:s3-lods/abc"},
+		// 边界：1label_001.png 以 '1' 开头,不命中 label 前缀,但无 / → 根文件兜底
+		{"1label_001 根文件兜底(非 label)", "1label_001.png", "s3:s3-lods/1label_001.png"},
+		// regex 兜底：{yyyyMMdd}/ 恰好 8 位日期目录
+		{"日期目录 20260608/ → lods", "20260608/x.dat", "s3:s3-lods/20260608/x.dat"},
+		{"日期目录 20260624/sub/y → lods", "20260624/sub/y", "s3:s3-lods/20260624/sub/y"},
+		// 带时分秒的不管：14 位不匹配 ^[0-9]{8}/,且含 / 非根文件 → skip
+		{"带时分秒 20260608120000/ → skip", "20260608120000/x", ""},
+		// 未知前缀(非根文件、非日期目录、未命中字面前缀)→ skip
+		{"未知前缀 weird/x → skip", "weird/x.bin", ""},
+		{"7 位数字目录(非 8 位)→ skip", "2026060/x", ""},
+		{"9 位数字目录(非 8 位)→ skip", "202606081/x", ""},
+	}
+	for _, c := range cases {
+		attrs := map[string]string{"eventType": eventFinalize, "bucketId": "tmseu-style", "objectId": c.key}
+		got, err := mapEvent(attrs, []byte(`{"size":"1"}`), testDest)
+		if err != nil {
+			t.Errorf("%s: 意外错误 %v", c.name, err)
+			continue
+		}
+		if c.wantDest == "" {
+			if !got.unknownBkt {
+				t.Errorf("%s: key=%q 应 skip(unknownBkt),got body=%s", c.name, c.key, got.Body)
+			}
+			continue
+		}
+		if got.unknownBkt || got.skip {
+			t.Errorf("%s: key=%q 应命中 %s,却被跳过", c.name, c.key, c.wantDest)
+			continue
+		}
+		m := mustMsg(t, got.Body)
+		if m.Destination != c.wantDest {
+			t.Errorf("%s: key=%q destination=%q want %q", c.name, c.key, m.Destination, c.wantDest)
+		}
 	}
 }
 

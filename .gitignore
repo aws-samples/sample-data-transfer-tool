@@ -55,3 +55,9 @@ Thumbs.db
 # Work status
 WORK_STATUS.md
 query_drive_id.py
+
+# gcs-event-bridge：运行配置含生产 ARN/queue/订阅，运维手册含生产拓扑（仅 config.example.yaml 入库）
+tools/gcs-event-bridge/config.yaml
+tools/gcs-event-bridge/OPS.html
+# gcs-event-bridge 编译产物
+tools/gcs-event-bridge/go/gcs-event-bridge

@@ -110,11 +110,12 @@ func resolveDest(mapping map[string]BucketRule, gcsBucket, objectKey string) (st
 		return "", "", false // 源桶未配映射
 	}
 	if rule.isPrefixRouted() {
-		// 写法 B：最长前缀优先。
+		// 写法 B 匹配顺序：① 字面前缀（最长优先）② regex（按配置顺序）③ default 兜底。
+		// 第一趟：字面前缀，最长优先（只看配了 Prefix 的路由）。
 		bestLen := -1
 		var best PrefixRoute
 		for _, pr := range rule.PrefixRoutes {
-			if strings.HasPrefix(objectKey, pr.Prefix) && len(pr.Prefix) > bestLen {
+			if pr.Prefix != "" && strings.HasPrefix(objectKey, pr.Prefix) && len(pr.Prefix) > bestLen {
 				bestLen = len(pr.Prefix)
 				best = pr
 			}
@@ -125,6 +126,12 @@ func resolveDest(mapping map[string]BucketRule, gcsBucket, objectKey string) (st
 				key = strings.TrimPrefix(objectKey, best.Prefix)
 			}
 			return best.S3Bucket, key, true
+		}
+		// 第二趟：regex（按配置顺序，首个命中者胜）。regex 路由保留完整 key（不剥前缀）。
+		for _, pr := range rule.PrefixRoutes {
+			if pr.re != nil && pr.re.MatchString(objectKey) {
+				return pr.S3Bucket, objectKey, true
+			}
 		}
 		if rule.DefaultS3Bucket != "" {
 			return rule.DefaultS3Bucket, objectKey, true // 兜底保留完整 key
