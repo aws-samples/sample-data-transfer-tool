@@ -216,35 +216,60 @@ def process_message(
 
     # 终态记录（UNKNOWN 也记，便于排查；但不计数、不删消息）。
     # 出错消息附完整原始消息体（2026-06-10 决策）；SUCCESS 不存（百万级行省容量）。
-    record_fn(
-        source=msg.source,
-        attempt_timestamp=now_iso,
-        result=result,
-        instance_id=instance_id,
-        message_body=None if result.state is State.SUCCESS else body,
-    )
+    #
+    # ★ best-effort（2026-06-26 生产事故根治）：DDB record_terminal 是**旁路状态记录**，
+    # 其失败绝不能阻断下方 SQS 生命周期动作（delete / requeue）。
+    # 实证：m8in-pool2 领到海量 src_not_found(FATAL) → 每条 record 一条带完整 body 的终态
+    # → DDB 写入风暴触发 ThrottlingException(max retries:5) → 旧实现异常穿透到 _safe_handle
+    # 被吞，requeue_fn **从未调用** → 消息卡满 visibility timeout → inflight 堆到 907K。
+    # 旁路记录无否决权：丢一条终态记录 ≪ 消息卡死/成功对象被重传。与上面 poison 路径的
+    # record 容错写法对齐。
+    try:
+        record_fn(
+            source=msg.source,
+            attempt_timestamp=now_iso,
+            result=result,
+            instance_id=instance_id,
+            message_body=None if result.state is State.SUCCESS else body,
+        )
+    except Exception:  # noqa: BLE001 - 记录失败不得阻断 delete/requeue（SQS 生命周期优先）
+        logger.exception(
+            "record_terminal 失败（state=%s source=%s）——降级 best-effort，继续 SQS 生命周期动作",
+            result.state.value, msg.source,
+        )
 
     # 监控上报（event 含 source 进明细层；EMF 维度只用低基数字段）。
     # date/hour 供 Firehose 动态分区（Athena 按小时聚合的前提）；event_time 留行级时间。
     # now_iso 形如 "2026-05-29T14:30:00.123"：[:10]=date, [11:13]=hour。
+    #
+    # ★ best-effort（与上面 record_fn 同源根治）：report_fn 也是**旁路监控**，位于
+    # delete/requeue 之前，同样无权阻断 SQS 生命周期。build_emf 的高基数维度守卫会抛
+    # ValueError、event 缺键会抛 KeyError、stdout 写失败也会抛——任一上抛都会让 SUCCESS
+    # 不删、失败态不 requeue，重现 inflight 风暴并跳过 _tally 丢四态计数。故同样吞掉只记日志。
     partition_date, partition_hour = _split_date_hour(now_iso)
-    report_fn(
-        {
-            "source": msg.source,
-            "destination": msg.destination,
-            "queue_type": queue_type,
-            "op": msg.op.value,
-            "error_class": result.error_class or "none",
-            "instance_id": instance_id,
-            "bytes": result.stats.bytes,
-            "elapsed": result.stats.elapsed_seconds,
-            "speed": result.stats.speed,
-            "state": result.state.value,
-            "event_time": now_iso,
-            "date": partition_date,
-            "hour": partition_hour,
-        }
-    )
+    try:
+        report_fn(
+            {
+                "source": msg.source,
+                "destination": msg.destination,
+                "queue_type": queue_type,
+                "op": msg.op.value,
+                "error_class": result.error_class or "none",
+                "instance_id": instance_id,
+                "bytes": result.stats.bytes,
+                "elapsed": result.stats.elapsed_seconds,
+                "speed": result.stats.speed,
+                "state": result.state.value,
+                "event_time": now_iso,
+                "date": partition_date,
+                "hour": partition_hour,
+            }
+        )
+    except Exception:  # noqa: BLE001 - 监控上报失败不得阻断 delete/requeue（SQS 生命周期优先）
+        logger.exception(
+            "report 失败（state=%s source=%s）——降级 best-effort，继续 SQS 生命周期动作",
+            result.state.value, msg.source,
+        )
 
     if result.state is State.SUCCESS:
         delete_fn()

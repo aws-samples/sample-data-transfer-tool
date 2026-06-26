@@ -346,6 +346,94 @@ class TestProcessMessageRcloneErrorLogging:
         assert "rclone copyto" not in caplog.text
 
 
+class TestProcessMessageRecordFailureDoesNotBlockLifecycle:
+    """根因回归（2026-06-26 生产事故）：DDB record_terminal 被 ThrottlingException
+    打挂时，SQS 生命周期动作（delete / requeue）绝不能被旁路记录的失败阻断。
+
+    线上实证：m8in-pool2 领到海量 src_not_found（FATAL）→ 每条都 record 一条带完整
+    body 的终态 → DDB 写入风暴触发节流 → record_fn 抛 ThrottlingException → 旧实现
+    异常穿透到 _safe_handle 被吞，requeue_fn **从未调用** → 消息卡满 visibility timeout
+    → inflight 堆到 907K。修复：record 失败降级为 best-effort（记日志），不阻断 delete/requeue。
+    """
+
+    def _throwing_record(self, **_kw):
+        raise RuntimeError("ThrottlingException: PutItem reached max retries: 5")
+
+    def test_success_still_deletes_when_record_throws(self):
+        # SUCCESS：传输事实已成立（对象已在 S3）。record 失败丢一条状态记录 ≪ 消息卡死，
+        # 必须照常 delete（否则成功消息卡满 visibility → 重投重传已成功对象，正反馈雪崩）。
+        spy = _Spy()
+        spy.record = self._throwing_record
+        result = _process(State.SUCCESS, spy)
+        assert result.state is State.SUCCESS
+        assert spy.deleted is True              # ★ record 抛错也必须删
+        assert result.counted is True
+
+    def test_fatal_still_requeues_when_record_throws(self):
+        # FATAL（如 src_not_found）：record 抛错也必须 requeue_fn(0)，让消息烧 ReceiveCount
+        # 进 DLQ，而非卡满 visibility timeout 堆积 inflight（正是 m8in-pool2 的事故）。
+        spy = _Spy()
+        spy.record = self._throwing_record
+        result = _process(State.FATAL, spy, error_class="src_not_found")
+        assert spy.deleted is False
+        assert spy.requeues == [0]              # ★ record 抛错也必须重投
+        assert result.counted is True
+
+    def test_retryable_still_requeues_with_backoff_when_record_throws(self):
+        spy = _Spy()
+        spy.record = self._throwing_record
+        result = _process(State.RETRYABLE, spy, error_class="src_rate_limit")
+        assert spy.deleted is False
+        assert spy.requeues == [300]            # ★ 退避分级不受 record 失败影响
+        assert result.counted is True
+
+    def test_record_failure_logged_not_swallowed_silently(self, caplog):
+        # record 失败必须留痕（ERROR 日志），便于定位 DDB 节流，而非静默吞掉。
+        import logging as _logging
+        spy = _Spy()
+        spy.record = self._throwing_record
+        with caplog.at_level(_logging.ERROR, logger="migration.worker"):
+            _process(State.SUCCESS, spy)
+        assert "record" in caplog.text.lower() or "terminal" in caplog.text.lower()
+
+    # ── report_fn 同为旁路（监控），同样不得阻断生命周期（Codex 交叉审查补漏）──
+    def _throwing_report(self, _event, **_kw):
+        # 复现 build_emf 的高基数守卫 ValueError / 缺键 KeyError / stdout 写失败
+        raise ValueError("EMF 高基数维度守卫触发")
+
+    def test_success_still_deletes_when_report_throws(self):
+        spy = _Spy()
+        spy.report = self._throwing_report
+        result = _process(State.SUCCESS, spy)
+        assert result.state is State.SUCCESS
+        assert spy.deleted is True              # ★ report 抛错也必须删
+        assert result.counted is True           # ★ 计数语义不丢
+
+    def test_fatal_still_requeues_when_report_throws(self):
+        spy = _Spy()
+        spy.report = self._throwing_report
+        result = _process(State.FATAL, spy, error_class="src_not_found")
+        assert spy.deleted is False
+        assert spy.requeues == [0]              # ★ report 抛错也必须重投
+        assert result.counted is True
+
+    def test_unknown_still_requeues_and_keeps_count_semantics_when_report_throws(self):
+        spy = _Spy()
+        spy.report = self._throwing_report
+        result = _process(State.UNKNOWN, spy)
+        assert spy.requeues == [0]
+        assert result.counted is False          # UNKNOWN 仍不计数（语义不变）
+
+    def test_both_record_and_report_throw_still_completes_lifecycle(self):
+        # 极端：record + report 同时挂，SUCCESS 仍删、计数仍对。
+        spy = _Spy()
+        spy.record = self._throwing_record
+        spy.report = self._throwing_report
+        result = _process(State.SUCCESS, spy)
+        assert spy.deleted is True
+        assert result.counted is True
+
+
 class TestProcessMessageBadBody:
     def test_malformed_body_does_not_delete(self):
         """Unparseable/invalid body → poison：记一条 FATAL 终态(可追溯)，但**不删**，
