@@ -151,6 +151,20 @@ def _bwlimit_flags(bwlimit: str) -> list[str]:
     return ["--bwlimit", bwlimit]
 
 
+# 下载侧统一带 Accept-Encoding: gzip。命门：GCS 上以 Content-Encoding: gzip 存储的
+# decompressive-transcoding 对象（如 *.json_lines.gz），若不带此 header，GCS 会即时
+# 解压后返回 → 传输字节与 rclone 记录的 stored size（压缩态）错位 → 上传侧整对象
+# CRC32C 算在解压流上、S3 按声明 size 收，两者对不上 → 400 BadDigest（实测复现）。
+# 带上 header 让 GCS 返回原始压缩字节，size 一致，CRC32C 正确落地。
+# 为何对所有源统一注入、对非压缩对象也无害（实测 + 源码双证）：
+#   1. 对象存储（GCS/S3）不会对未压缩对象动态 gzip，header 被忽略、原样返回；
+#   2. Go transport "谁加 Accept-Encoding 谁负责解压"——用户显式设值后，transport
+#      不再透明解压（net/http/transport.go），普通对象响应 Content-Encoding 为空，
+#      gzipReader 分支不触发，字节原样到达。
+# 仅 copy/refresh（走 copyto 下载路径）拼；delete 不下载，不拼。
+_HEADER_DOWNLOAD_GZIP = ["--header-download", "Accept-Encoding: gzip"]
+
+
 def _tpslimit_flags(tpslimit: str) -> list[str]:
     """请求频率限速 flag：off/空 → 不拼；否则 --tpslimit <值>（次/秒）。
 
@@ -219,6 +233,9 @@ def build_cmd(
         # op=refresh：忽略 size/mtime 强制重传，使源端 metadata-only 变更刷到目标
         # （rclone -I/--ignore-times = "transfer all unconditionally"）。仅 REFRESH 拼。
         *(["--ignore-times"] if msg.op is Op.REFRESH else []),
+        # 下载侧统一带 Accept-Encoding: gzip（见 _HEADER_DOWNLOAD_GZIP 注释）：
+        # 修 GCS gzip transcoding 对象的 BadDigest，对非压缩对象无害。
+        *_HEADER_DOWNLOAD_GZIP,
         # 动态限速：仅当控制面下发有限值时才拼（默认 off 不拼）。
         *_bwlimit_flags(bwlimit),
         # 请求频率限速：手动 SSM 下发有限值时才拼（默认 off 不拼）。

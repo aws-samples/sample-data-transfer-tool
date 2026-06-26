@@ -247,6 +247,45 @@ class TestBuildCmd:
         cmd = build_cmd(msg(), "/cfg/rclone.conf", is_large=False, tpslimit="off")
         assert "--tpslimit" not in cmd
 
+    # ── --header-download（下载侧统一注入 Accept-Encoding: gzip）──
+    # GCS decompressive-transcoding 对象（Content-Encoding: gzip）若不带此 header，
+    # 服务端会即时解压返回 → 传输字节与 rclone 记录的 stored size 错位 → 上传侧
+    # CRC32C 校验失败（BadDigest）。对所有源恒定注入。
+    # 对非压缩对象无害——对象存储不会对未压缩对象动态 gzip，header 被忽略；且
+    # 用户显式设 Accept-Encoding 后 Go transport 不再透明解压（"谁加谁解压"），
+    # 普通对象响应 Content-Encoding 为空，原样返回。实测 + 源码双重验证。
+    def test_header_download_injected_for_gz_source(self):
+        m = msg(source="gcs:bucket/edgio-waf/x.json_lines.gz")
+        cmd = build_cmd(m, "/cfg/rclone.conf", is_large=False)
+        assert "--header-download" in cmd
+        hi = cmd.index("--header-download")
+        assert cmd[hi + 1] == "Accept-Encoding: gzip"
+        assert hi < cmd.index("--"), "--header-download 必须在终结符前"
+
+    def test_header_download_injected_for_non_gz_source(self):
+        # 非压缩源同样注入（对象存储不动态压缩，无害）。
+        m = msg(source="gcs:bucket/data/x.json")
+        cmd = build_cmd(m, "/cfg/rclone.conf", is_large=False)
+        assert "--header-download" in cmd
+        hi = cmd.index("--header-download")
+        assert cmd[hi + 1] == "Accept-Encoding: gzip"
+
+    def test_header_download_injected_for_refresh(self):
+        # refresh 走 copyto 下载路径，同样注入。
+        from migration.models import Op
+
+        m = msg(source="gcs:bucket/x.json", op=Op.REFRESH)
+        cmd = build_cmd(m, "/cfg/rclone.conf", is_large=False)
+        assert "--header-download" in cmd
+
+    def test_header_download_absent_in_delete_path(self):
+        # delete 不下载，绝不拼下载侧 header（即便 destination 以 .gz 结尾）。
+        from migration.models import Op
+
+        m = msg(destination="s3:dst/x.gz", op=Op.DELETE)
+        cmd = build_cmd(m, "/cfg/rclone.conf", is_large=False)
+        assert "--header-download" not in cmd
+
     def test_bwlimit_and_tpslimit_coexist(self):
         # 两维限速可同时下发，互不影响。
         cmd = build_cmd(
