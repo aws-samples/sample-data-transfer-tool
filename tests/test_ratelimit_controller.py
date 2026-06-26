@@ -114,10 +114,25 @@ class TestAimd:
         assert rc.aimd_adjust(actual_gbps=50, target_gbps=0, current_bwlimit=1_000_000) == 0
 
     def test_fast_brake_on_spike(self):
-        # spike > 红线×1.2 → ×0.5
+        # spike > 物理红线×1.1 → ×0.5(快刹守物理红线,不打 headroom)
         out = rc.aimd_adjust(actual_gbps=10, target_gbps=100, current_bwlimit=200_000_000,
                              spike_gbps=130)
         assert out == rc.clamp_floor(int(200_000_000 * rc.FAST_BRAKE_FACTOR))
+
+    def test_fast_brake_boundary_at_1_1(self):
+        # 边界:spike 在 物理红线×1.1(=110) 之下不快刹,之上快刹。actual 落新死区隔离慢回路。
+        base = 200_000_000
+        below = rc.aimd_adjust(actual_gbps=76, target_gbps=100, current_bwlimit=base, spike_gbps=105)
+        assert below == base, "spike<红线×1.1 不应快刹"
+        above = rc.aimd_adjust(actual_gbps=76, target_gbps=100, current_bwlimit=base, spike_gbps=115)
+        assert above == rc.clamp_floor(int(base * rc.FAST_BRAKE_FACTOR)), "spike>红线×1.1 应快刹"
+
+    def test_headroom_decrease_between_effective_and_physical(self):
+        # headroom 核心:actual 在 effective(target×0.8=80) 与物理红线(100) 之间 →
+        # 慢回路主动 ×0.8 收紧,把稳态拉到红线下方。spike=85<110 不触发快刹。
+        out = rc.aimd_adjust(actual_gbps=85, target_gbps=100, current_bwlimit=200_000_000,
+                             spike_gbps=85)
+        assert out == rc.clamp_floor(int(200_000_000 * rc.DECREASE_FACTOR))
 
     def test_throttle_override_multiplicative_decrease(self):
         out = rc.aimd_adjust(actual_gbps=10, target_gbps=100, current_bwlimit=200_000_000,
@@ -130,13 +145,16 @@ class TestAimd:
         assert out == rc.clamp_floor(int(200_000_000 * rc.DECREASE_FACTOR))
 
     def test_below_target_additive_increase(self):
+        # actual 远低于 effective(=target×0.8=80)的死区下界(72)→ 加性增。
         out = rc.aimd_adjust(actual_gbps=50, target_gbps=100, current_bwlimit=200_000_000,
                              spike_gbps=50)
         assert out == 200_000_000 + rc.INCREASE_STEP_BYTES
 
     def test_deadzone_holds(self):
-        out = rc.aimd_adjust(actual_gbps=95, target_gbps=100, current_bwlimit=200_000_000,
-                             spike_gbps=95)
+        # 新死区围绕 effective_target=target×0.8=80 → [effective×0.9, effective]=[72,80]。
+        # actual=76 落入死区 → 保持;spike=76<物理红线×1.1=110 不触发快刹。
+        out = rc.aimd_adjust(actual_gbps=76, target_gbps=100, current_bwlimit=200_000_000,
+                             spike_gbps=76)
         assert out == 200_000_000
 
     def test_cold_start_uses_base(self):
@@ -153,10 +171,16 @@ class TestAimd:
 # ───────────────────────── damp_step ───────────────────────────────────────
 class TestDamp:
     def test_caps_increase_to_125pct(self):
+        # 放开方向(增)仍限幅 +25%:温和爬升防震荡。
         assert rc.damp_step(old=100_000_000, proposed=400_000_000) == 125_000_000
 
-    def test_caps_decrease_to_75pct(self):
-        assert rc.damp_step(old=100_000_000, proposed=10_000_000) == 75_000_000
+    def test_caps_decrease_to_50pct(self):
+        # 收紧方向(减)放宽到 -50%:让 fast-brake 的 ×0.5 真正一步落地。
+        assert rc.damp_step(old=100_000_000, proposed=10_000_000) == 50_000_000
+
+    def test_decrease_within_limit_passes(self):
+        # 降幅在 -50% 内 → 原样通过(80M 相对 100M 只降 20%)。
+        assert rc.damp_step(old=100_000_000, proposed=80_000_000) == 80_000_000
 
     def test_small_change_passes(self):
         assert rc.damp_step(old=100_000_000, proposed=105_000_000) == 105_000_000
@@ -287,35 +311,46 @@ class TestProcessClusterIntegration:
     def _cluster(self):
         return {"name": "m6in-pool1", "asg": "asg-m6in", "threads": 16, "worker_count": 16}
 
-    def test_steady_at_target_does_not_brake_to_floor(self):
-        # 真实稳态恒 200Gbps(=target)。修复后取完整桶 → actual≈spike≈200 → 落死区,保持不变;
-        # 旧实现会把 actual 读成 ~20、spike 读成 ~100(假),且某些桶 >240 误触 fast-brake 砸地板。
+    def test_steady_at_target_decreases_for_headroom(self):
+        # 真实稳态恒 200Gbps(=物理 target)。headroom 后 effective=160,actual=200>160
+        # → 慢回路主动 ×0.8 收紧,把稳态拉到红线下方(留 20% 余量,防过冲)。
+        # spike=200<物理红线×1.1=220 → 不触发 fast-brake;收紧受非对称 damp -50% 限幅。
         ssm = self._ssm()
         cw = _ScenarioCw(real_gbps=200.0, instances=30)
         out = rc._process_cluster(ssm, cw, self._cluster(), slow=300, fast=60, emf_ns="GcsS3Migration")
-        written = ssm.writes[self.BASE + "bwlimit"]
-        # 死区保持上轮 100.00M,绝不是地板 9.54M
-        assert written == "100.00M", f"稳态在目标应保持,不该砸地板,实际写={written}"
+        written = rc.parse_bwlimit_bytes(ssm.writes[self.BASE + "bwlimit"])
+        # 上轮 100M,慢回路 ×0.8=80M,降幅 20% 在 damp -50% 内 → 写 80M(主动收紧,不再贴红线)
+        assert written < rc.parse_bwlimit_bytes("100.00M"), "稳态在物理红线应为 headroom 主动收紧"
         assert out["mode"] == "auto"
 
     def test_genuinely_underloaded_increases_not_brakes(self):
-        # 真实欠载:恒 50Gbps(<target×0.9=180)。修复后 actual=spike=50 → 加性增(不触 fast-brake)。
+        # 真实欠载:恒 50Gbps(<effective×0.9=144)。actual=spike=50 → 加性增(不触 fast-brake)。
         ssm = self._ssm(bwlimit="50.00M")
         cw = _ScenarioCw(real_gbps=50.0, instances=30)
         rc._process_cluster(ssm, cw, self._cluster(), slow=300, fast=60, emf_ns="GcsS3Migration")
         written = rc.parse_bwlimit_bytes(ssm.writes[self.BASE + "bwlimit"])
-        # 应比上轮 50M 高(加性增 +50MB/s,受 damp ±25% 限幅),而不是被砸到地板
+        # 应比上轮 50M 高(加性增 +50MB/s,受 damp +25% 限幅),而不是被砸到地板
         assert written > rc.parse_bwlimit_bytes("50.00M"), "真实欠载应加性增放开,而非刹车"
         assert written > rc.MIN_BWLIMIT_BYTES
 
+    def test_in_headroom_band_decreases(self):
+        # actual 落在 effective(160) 与物理红线(200) 之间(=180):headroom 的核心场景——
+        # 慢回路认定"超 effective"主动收紧,把吞吐压回红线下方。spike=180<220 不快刹。
+        ssm = self._ssm()
+        cw = _ScenarioCw(real_gbps=180.0, instances=30)
+        rc._process_cluster(ssm, cw, self._cluster(), slow=300, fast=60, emf_ns="GcsS3Migration")
+        written = rc.parse_bwlimit_bytes(ssm.writes[self.BASE + "bwlimit"])
+        assert written < rc.parse_bwlimit_bytes("100.00M"), "headroom 区间应主动收紧"
+
     def test_genuine_spike_still_fast_brakes(self):
-        # 真实尖峰:恒 300Gbps(>target×1.2=240)。修复后完整桶仍读到 300 → fast-brake 仍生效(没误删功能)。
+        # 真实尖峰:恒 300Gbps(>物理红线×1.1=220)。完整桶读到 300 → fast-brake 仍生效。
         ssm = self._ssm(bwlimit="100.00M")
         cw = _ScenarioCw(real_gbps=300.0, instances=30)
         rc._process_cluster(ssm, cw, self._cluster(), slow=300, fast=60, emf_ns="GcsS3Migration")
         written = rc.parse_bwlimit_bytes(ssm.writes[self.BASE + "bwlimit"])
-        # 真超速该收紧(受 damp ±25% 限幅,从 100M 最多降到 75M)
+        # 快刹 ×0.5=50M,降幅 50% 恰在 damp -50% 边界内 → 一步落地到 50M
         assert written < rc.parse_bwlimit_bytes("100.00M"), "真实尖峰仍应 fast-brake 收紧"
+        assert written <= rc.parse_bwlimit_bytes("50.00M") + 1, "非对称 damp 应让 ×0.5 一步落地"
 
     def test_tpslimit_written_from_target_and_proccount(self):
         # tpslimit = target ÷ (实例×进程×线程)。tps_target=5000,30×16×16=7680 → 0.65
@@ -361,8 +396,8 @@ class TestHandlerEndToEnd:
         monkeypatch.setenv("FAST_WINDOW_SEC", "60")
         result = rc.handler({}, None)
         assert result["clusters"][0]["cluster"] == "m6in-pool1"
-        # 稳态在目标 → bwlimit 保持 100M(不砸地板),tpslimit=0.65
-        assert ssm.writes[base + "bwlimit"] == "100.00M"
+        # 稳态 200G(=物理 target)> effective 160G → headroom 主动收紧到 80M(不砸地板),tpslimit=0.65
+        assert ssm.writes[base + "bwlimit"] == "80.00M"
         assert ssm.writes[base + "tpslimit"] == "0.65"
 
     def test_handler_one_cluster_failure_isolated(self, monkeypatch):
