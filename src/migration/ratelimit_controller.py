@@ -21,7 +21,11 @@ import time
 # ── 控制律常量 ──
 DECREASE_FACTOR = 0.8            # 乘性减:超 effective_target ×0.8
 INCREASE_STEP_BYTES = 50_000_000  # 加性增步长 +50MB/s
-MIN_BWLIMIT_BYTES = 10_000_000    # 地板 10MB/s
+# 地板 6MB/s(原 10M)：降到 ≤ 公平份额(400G/7680≈6.21M),使"全 fleet 满速"的理论
+# 聚合(6M×7680×8≈387G)落在红线 400G 之下——堵死冷启动/空闲后聚合过冲的最后一道缝
+# (10M 地板时满速理论 644G>红线,fair-share 也压不下去,Codex 复核确认)。代价:连续收紧
+# 时单进程最低 6M(原 10M),极端限速下吞吐略低;稳态由 AIMD 按实测并发率自由抬高,不受影响。
+MIN_BWLIMIT_BYTES = 6_000_000
 DEADZONE_LOWER_RATIO = 0.9        # 死区下界
 DEADZONE_UPPER_RATIO = 1.1        # 死区上界(暂未单独用,保留语义)
 # 保守化(防过冲):慢回路瞄准 target×0.8 而非 target,稳态收敛到红线**下方**留 20% 余量
@@ -32,12 +36,20 @@ SAFETY_HEADROOM_RATIO = 0.8
 # 让 fast-brake 的 ×0.5 一步真正落地(对称 ±25% 会把 ×0.5 重新夹回 -25%,刹不到位)。
 MAX_STEP_UP_RATIO = 0.25
 MAX_STEP_DOWN_RATIO = 0.5
+# 空闲判定:actual < target×此比例 视为"空闲/几乎无传输"。空闲后来活会有大量进程
+# 同时满速 → 聚合过冲,故空闲爬升的初值必须夹到"全满速正好=红线"的公平份额,而非
+# 补偿有效并发率的高 cap 值(冷启动 447G 过冲根因)。取 0.05 = 红线的 5%。
+IDLE_ACTUAL_RATIO = 0.05
 FAST_BRAKE_RATIO = 1.1            # 快刹触发:spike > 物理红线×1.1(守物理红线,非 effective;
                                  # 稳态瞄 0.8×红线,留 1.1/0.8≈37% 噪声空间防 sawtooth 误刹)
 FAST_BRAKE_FACTOR = 0.5           # 快速收紧系数 ×0.5
 THROTTLE_OVERRIDE_RATE = 0.05     # 429 率超 5% 强制收紧
 COLD_START_BWLIMIT_BYTES = 1_000_000_000  # 冷启动基数(off→需限速时)
-SAFETY_MULTIPLIER = 4             # 护栏:公平份额 ×4
+# 护栏倍数:cap = 公平份额 × 此值。取 8(非 4)——修复 _active_threads 漏乘 worker_count 后,
+# 除数从偏小 16 倍恢复成真实进程数,若仍 ×4 则 cap 会低到稳态值之下(实测稳态≈14.9M,
+# ×4 cap≈24.8M、damp 后碰稳态,误伤正常 headroom 收紧/欠载加性增)。×8 → cap≈49.7M,
+# 是稳态 3.3 倍:稳态自由活动不被夹,只拦冷启动(1GB)/空爬这类虚高。仍是"宽松护栏",AIMD 主控。
+SAFETY_MULTIPLIER = 8
 _BITS_PER_BYTE = 8
 _GIGA = 1_000_000_000
 _MIB = 1_048_576
@@ -50,7 +62,8 @@ def clamp_floor(value: int) -> int:
 
 
 def aimd_adjust(*, actual_gbps: float, target_gbps: float, current_bwlimit: int,
-                throttle_rate: float = 0.0, spike_gbps: float | None = None) -> int:
+                throttle_rate: float = 0.0, spike_gbps: float | None = None,
+                fair_share_bytes: int | None = None) -> int:
     """AIMD 控制律:返回新单进程 bwlimit(字节/秒,0=off)。
 
     两层目标(保守化防过冲):
@@ -59,6 +72,12 @@ def aimd_adjust(*, actual_gbps: float, target_gbps: float, current_bwlimit: int,
     - 快刹对照**物理红线** target_gbps × FAST_BRAKE_RATIO(异常突增才介入,不打 headroom)。
     优先级:红线off → 快刹(spike>物理红线×1.1) → 429(>5%) → 慢回路(超 effective 乘性减/
     欠载加性增/死区保持)。actual∈[effective, 物理红线] 时慢回路主动收紧——这正是 headroom 的本意。
+
+    公平份额冷启动(fair_share_bytes,防空闲后聚合过冲):空闲(actual<红线×IDLE_ACTUAL_RATIO)
+    时的加性增结果夹到 fair_share(= 红线/进程数,"全满速正好=红线"的值)。原因:稳态单进程
+    可高于公平份额是靠"有效并发率低(部分进程没满速)"补偿,但空闲后来活瞬间大量进程**同时**
+    满速,该补偿不成立 → 必须从公平份额起步,再靠 AIMD 按实测往上抬,而非一上来顶到 cap 后
+    靠乘性减往下砸(砸有 2-3min 滞后,过冲已发生)。None=不传则保持原行为(向后兼容)。
     """
     if target_gbps <= 0:
         return 0
@@ -73,7 +92,11 @@ def aimd_adjust(*, actual_gbps: float, target_gbps: float, current_bwlimit: int,
     if actual_gbps > effective_target:
         return clamp_floor(int(base * DECREASE_FACTOR))
     if actual_gbps < effective_target * DEADZONE_LOWER_RATIO:
-        return base + INCREASE_STEP_BYTES
+        increased = base + INCREASE_STEP_BYTES
+        # 空闲(几乎无传输)且已知公平份额 → 夹到公平份额,防空闲后聚合过冲。
+        if fair_share_bytes is not None and actual_gbps < target_gbps * IDLE_ACTUAL_RATIO:
+            return min(increased, fair_share_bytes)
+        return increased
     return current_bwlimit
 
 
@@ -89,6 +112,17 @@ def damp_step(*, old: int, proposed: int) -> int:
     return max(lo, min(proposed, hi))
 
 
+def fair_share_bytes_of(*, target_gbps: float, threads: int) -> int | None:
+    """公平份额 = 全局目标 ÷ 进程数(= "全 fleet 满速正好=红线"的单进程值)。
+
+    用作空闲冷启动的 bwlimit 初值(防聚合过冲)。threads<=0(指标缺失)返回 None,
+    调用方据此跳过 fair-share 夹制(无从计算,交给为空兜底逻辑)。
+    """
+    if target_gbps <= 0 or threads <= 0:
+        return None
+    return int(target_gbps * _GIGA / _BITS_PER_BYTE) // threads
+
+
 def safety_cap_bytes(*, target_gbps: float, threads: int) -> int:
     """单进程宽松护栏 = 公平份额(全局目标÷进程数) × SAFETY_MULTIPLIER。"""
     if target_gbps <= 0:
@@ -101,7 +135,8 @@ def safety_cap_bytes(*, target_gbps: float, threads: int) -> int:
 
 def decide_bwlimit(*, limit_enabled: bool, auto_enabled: bool, target_gbps: float,
                    actual_gbps: float, current_bwlimit: int,
-                   throttle_rate: float = 0.0, spike_gbps: float | None = None) -> tuple[int, str]:
+                   throttle_rate: float = 0.0, spike_gbps: float | None = None,
+                   fair_share_bytes: int | None = None) -> tuple[int, str]:
     """两开关总决策。返回 (新 bwlimit 字节/秒, 模式名)。"""
     if not limit_enabled:
         return 0, "unlimited"
@@ -109,7 +144,7 @@ def decide_bwlimit(*, limit_enabled: bool, auto_enabled: bool, target_gbps: floa
         return current_bwlimit, "manual"
     new = aimd_adjust(actual_gbps=actual_gbps, target_gbps=target_gbps,
                       current_bwlimit=current_bwlimit, throttle_rate=throttle_rate,
-                      spike_gbps=spike_gbps)
+                      spike_gbps=spike_gbps, fair_share_bytes=fair_share_bytes)
     return new, "auto"
 
 
@@ -230,9 +265,14 @@ def _instances(cw, asg: str) -> int:
     return int(round(sorted(pts, key=lambda p: p["Timestamp"])[-1]["Average"])) if pts else 0
 
 
-def _active_threads(cw, asg: str, worker_threads: int) -> int:
-    """bwlimit 护栏用的线程估算(实例数 × 每进程线程数)。"""
-    return _instances(cw, asg) * worker_threads
+def _active_threads(cw, asg: str, worker_threads: int, worker_count: int) -> int:
+    """bwlimit 护栏除数 = 真实并发 rclone 进程数 = 实例数 × 每机进程数 × 每进程线程数。
+
+    根因修复:旧实现漏乘 worker_count,使护栏除数偏小 worker_count 倍 → safety_cap 被
+    放大同等倍数 → 形同虚设(冷启动/空爬时 bwlimit 冲到红线之上无人拦,520G 过冲元凶)。
+    与 tpslimit 用的 process_count_from 同源——单一真相,不再分叉。
+    """
+    return _instances(cw, asg) * max(0, worker_count) * worker_threads
 
 
 def _sum_emf_attempt(cw, namespace: str, state: str, error_class: str | None, window_sec: int) -> float:
@@ -278,15 +318,28 @@ def _process_cluster(ssm, cw, cluster: dict, slow: int, fast: int, emf_ns: str) 
         spike_gbps = _network_in_gbps(cw, asg, fast)
         throttle = _throttle_rate(cw, emf_ns, fast)
 
+    # 并发进程数只测一次(bwlimit 护栏 + tpslimit 分摊共用),省一次 CloudWatch 调用。
+    instances = _instances(cw, asg)
+    proc_count = process_count_from(instances=instances, worker_count=worker_count,
+                                    worker_threads=threads_cfg)
+
+    # 公平份额 = 红线/进程数,空闲冷启动初值(防来活聚合过冲);proc_count<=0 时为 None。
+    fair_share = fair_share_bytes_of(target_gbps=target_gbps, threads=proc_count)
     new_bw, mode = decide_bwlimit(
         limit_enabled=limit_enabled, auto_enabled=auto_enabled, target_gbps=target_gbps,
         actual_gbps=actual_gbps, current_bwlimit=current_bw,
-        throttle_rate=throttle, spike_gbps=spike_gbps)
+        throttle_rate=throttle, spike_gbps=spike_gbps, fair_share_bytes=fair_share)
     if mode == "auto" and new_bw > 0:
-        threads = _active_threads(cw, asg, threads_cfg)
-        cap = safety_cap_bytes(target_gbps=target_gbps, threads=threads)
-        if cap > 0:
-            new_bw = min(new_bw, cap)
+        if proc_count > 0:
+            # 自适应硬上限:跟随本集群 target/进程数自动算,只夹"空爬/冷启动"的虚高,不碰稳态。
+            new_bw = min(new_bw, safety_cap_bytes(target_gbps=target_gbps, threads=proc_count))
+        else:
+            # 为空爆高根治:实例指标缺失(冷启动/抖动)时绝不放行 AIMD 高值(冷启动基数 1GB)
+            # —— 此刻 cap 无从计算,夹到上一轮 current_bw(无则地板),等指标恢复再正常爬。
+            # 留痕:指标若**持续**缺失,bwlimit 会冻结在 current_bw(且无 proc-count cap 保护)——
+            # 打 warning 让"集群指标长期读不到"这个隐患可被发现,而非静默 hold。
+            print(f"[{name}] WARN instances 指标缺失(proc_count=0),bwlimit 夹到 current_bw 不放行 AIMD 高值,等指标恢复")
+            new_bw = min(new_bw, current_bw if current_bw > 0 else MIN_BWLIMIT_BYTES)
         new_bw = damp_step(old=current_bw, proposed=new_bw)
         new_bw = max(new_bw, MIN_BWLIMIT_BYTES)
     value = format_bwlimit(new_bw)
@@ -294,9 +347,7 @@ def _process_cluster(ssm, cw, cluster: dict, slow: int, fast: int, emf_ns: str) 
 
     # ── tpslimit:全 fleet 总目标 ÷ 当前并发进程数(独立于 bwlimit/AIMD,无开关门控)──
     total_tps = parse_tps_target(_get(ssm, base + "tpslimit-target", "off"))
-    instances = _instances(cw, asg)
-    pcount = process_count_from(instances=instances, worker_count=worker_count,
-                                worker_threads=threads_cfg)
+    pcount = proc_count
     tps_value = decide_tpslimit(total_tps=total_tps, process_count=pcount)
     ssm.put_parameter(Name=base + "tpslimit", Value=tps_value, Type="String", Overwrite=True)
 
