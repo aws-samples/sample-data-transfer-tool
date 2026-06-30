@@ -43,6 +43,21 @@ Parameters:
     Type: String
     NoEcho: true
     Description: OneDrive Tenant ID
+  DropboxAppKey:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Dropbox Business App Key (client_id)
+  DropboxAppSecret:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Dropbox Business App Secret (client_secret)
+  DropboxRefreshToken:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Dropbox offline refresh token (token_access_type=offline)
   DestinationBucket:
     Type: String
     Default: ''
@@ -83,7 +98,10 @@ Resources:
         {
           "client_id": "${OneDriveClientId}",
           "client_secret": "${OneDriveClientSecret}",
-          "tenant_id": "${OneDriveTenantId}"
+          "tenant_id": "${OneDriveTenantId}",
+          "dropbox_app_key": "${DropboxAppKey}",
+          "dropbox_app_secret": "${DropboxAppSecret}",
+          "dropbox_refresh_token": "${DropboxRefreshToken}"
         }
       Tags:
         - Key: Project
@@ -285,8 +303,8 @@ Resources:
               content: |
                 #!/usr/bin/env python3
                 """
-                Simplified OneDrive Token Refresh Script for rclone
-                Only maintains 3 remotes: s3, onedrive, sharepoint
+                Token Refresh Script for rclone
+                Maintains remotes: s3, onedrive, sharepoint, dropbox (optional)
                 """
                 import requests
                 import json
@@ -331,7 +349,43 @@ Resources:
                         'expiry': expiry.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
                         'expires_in': expires_in
                     }
-                
+
+                def get_dropbox_credentials():
+                    """Retrieve Dropbox credentials from AWS Secrets Manager (optional)"""
+                    secrets_client = boto3.client('secretsmanager', region_name=os.environ['AWS_REGION'])
+                    secret_response = secrets_client.get_secret_value(SecretId=os.environ['SECRET_ARN'])
+                    credentials = json.loads(secret_response['SecretString'])
+                    return (
+                        credentials.get('dropbox_app_key', ''),
+                        credentials.get('dropbox_app_secret', ''),
+                        credentials.get('dropbox_refresh_token', '')
+                    )
+
+                def get_dropbox_token(app_key, app_secret, refresh_token):
+                    """Get OAuth2 access token from Dropbox using refresh token"""
+                    token_url = "https://api.dropboxapi.com/oauth2/token"
+                    data = {
+                        'grant_type': 'refresh_token',
+                        'refresh_token': refresh_token,
+                        'client_id': app_key,
+                        'client_secret': app_secret
+                    }
+
+                    response = requests.post(token_url, data=data)
+                    response.raise_for_status()
+                    token_data = response.json()
+
+                    expires_in = token_data.get('expires_in', 14400)
+                    expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+
+                    # rclone dropbox token 需含 refresh_token，rclone 据此自动续期
+                    return {
+                        'access_token': token_data['access_token'],
+                        'token_type': 'bearer',
+                        'refresh_token': refresh_token,
+                        'expiry': expiry.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+                    }
+
                 def update_rclone_config():
                     """Update rclone configuration with simplified 3-remote setup"""
                     logger.info("Starting rclone configuration update")
@@ -386,7 +440,23 @@ Resources:
                         })
                         
                         logger.info("Updated tokens for onedrive and sharepoint remotes")
-                        
+
+                        # Configure Dropbox remote (optional) - only if credentials present
+                        DBX_APP_KEY, DBX_APP_SECRET, DBX_REFRESH_TOKEN = get_dropbox_credentials()
+                        if DBX_APP_KEY and DBX_APP_SECRET and DBX_REFRESH_TOKEN:
+                            dropbox_token = get_dropbox_token(DBX_APP_KEY, DBX_APP_SECRET, DBX_REFRESH_TOKEN)
+                            if 'dropbox' not in config:
+                                config.add_section('dropbox')
+                            config['dropbox'].update({
+                                'type': 'dropbox',
+                                'client_id': DBX_APP_KEY,
+                                'client_secret': DBX_APP_SECRET,
+                                'token': json.dumps(dropbox_token)
+                            })
+                            logger.info("Updated token for dropbox remote")
+                        else:
+                            logger.info("Dropbox credentials not found, skipping dropbox remote")
+
                         # Write configuration file
                         with open(rclone_config_path, 'w') as f:
                             config.write(f)

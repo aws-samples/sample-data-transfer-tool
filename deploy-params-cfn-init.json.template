@@ -28,6 +28,18 @@
     "ParameterValue": "YOUR_TENANT_ID_HERE"
   },
   {
+    "ParameterKey": "DropboxAppKey",
+    "ParameterValue": "YOUR_DROPBOX_APP_KEY"
+  },
+  {
+    "ParameterKey": "DropboxAppSecret",
+    "ParameterValue": "YOUR_DROPBOX_APP_SECRET"
+  },
+  {
+    "ParameterKey": "DropboxRefreshToken",
+    "ParameterValue": "YOUR_DROPBOX_REFRESH_TOKEN"
+  },
+  {
     "ParameterKey": "DestinationBucket",
     "ParameterValue": "your-bucket-name"
   }
