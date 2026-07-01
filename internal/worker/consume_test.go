@@ -157,3 +157,48 @@ func TestConsumer_SuccessDeletesAll(t *testing.T) {
 		t.Errorf("应记录 3 次，got %d", rec.count.Load())
 	}
 }
+
+// G1 计数正交性(go-reviewer 抓的 CRITICAL):record best-effort 后,record 失败的消息
+// 带真实四态(SUCCESS/FATAL/RETRYABLE, RecordFailed=true)。tally 必须让四态照常入桶 +
+// RecordFail 独立 +1,不能因 RecordFailed 短路吞掉四态计数(否则 DDB 节流时 Success 塌陷
+// 污染判活/可观测性,正是 G1 事故"旁路不污染主干"要防的)。对齐 Python _tally:四态照常。
+func TestTally_RecordFailStillCountsFourStates(t *testing.T) {
+	newC := func() (*Consumer, *Stats) {
+		st := &Stats{}
+		c := NewConsumer(&fakeSQS{}, ConsumerConfig{QueueURL: "q", Receivers: 1, Workers: 1},
+			"i#0", nil, &fakeRecorder{}, func(EMFEvent) {}, st)
+		return c, st
+	}
+	cases := []struct {
+		name                            string
+		o                               Outcome
+		success, fatal, retry, unknown, poison, recordFail int64
+	}{
+		{"success+recordfail", Outcome{State: model.StateSuccess, Counted: true, RecordFailed: true}, 1, 0, 0, 0, 0, 1},
+		{"fatal+recordfail", Outcome{State: model.StateFatal, Counted: true, RecordFailed: true}, 0, 1, 0, 0, 0, 1},
+		{"retryable+recordfail", Outcome{State: model.StateRetryable, Counted: true, RecordFailed: true}, 0, 0, 1, 0, 0, 1},
+		{"poison+recordfail 仍只计 poison", Outcome{State: model.StateFatal, Poison: true, RecordFailed: true}, 0, 0, 0, 0, 1, 1},
+		{"success 无 recordfail", Outcome{State: model.StateSuccess, Counted: true}, 1, 0, 0, 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, st := newC()
+			c.tally(tc.o)
+			if got := st.Success.Load(); got != tc.success {
+				t.Errorf("Success=%d 期望 %d", got, tc.success)
+			}
+			if got := st.Fatal.Load(); got != tc.fatal {
+				t.Errorf("Fatal=%d 期望 %d", got, tc.fatal)
+			}
+			if got := st.Retryable.Load(); got != tc.retry {
+				t.Errorf("Retryable=%d 期望 %d", got, tc.retry)
+			}
+			if got := st.Poison.Load(); got != tc.poison {
+				t.Errorf("Poison=%d 期望 %d", got, tc.poison)
+			}
+			if got := st.RecordFail.Load(); got != tc.recordFail {
+				t.Errorf("RecordFail=%d 期望 %d", got, tc.recordFail)
+			}
+		})
+	}
+}

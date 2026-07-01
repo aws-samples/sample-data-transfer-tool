@@ -17,11 +17,12 @@ type recorder struct {
 	recordedBody   string
 	recordedSrc    string
 	recordedResult model.RunResult
-	reported       bool
-	reportState    string
-	reportEvent    EMFEvent
-	recordErr      error
-	deleteErr      error
+	reported           bool
+	reportState        string
+	reportEvent        EMFEvent
+	recordFailReported bool // 上报过 record_fail 事件（不被后续 reportResult 覆盖）
+	recordErr          error
+	deleteErr          error
 }
 
 func (r *recorder) effects(result model.RunResult) Effects {
@@ -35,7 +36,14 @@ func (r *recorder) effects(result model.RunResult) Effects {
 			r.recordedBody = body
 			return r.recordErr
 		},
-		Report: func(ev EMFEvent) { r.reported = true; r.reportState = ev.State; r.reportEvent = ev },
+		Report: func(ev EMFEvent) {
+			r.reported = true
+			r.reportState = ev.State
+			r.reportEvent = ev
+			if ev.ErrorClass == "record_fail" {
+				r.recordFailReported = true
+			}
+		},
 	}
 }
 
@@ -173,21 +181,56 @@ func TestQueueTypeDimension(t *testing.T) {
 	// 200MB ≥ 100MB 阈值 → large（仅维度，非路由）
 }
 
-func TestRecordFailureRequeuesAndReportsUnknown(t *testing.T) {
-	r := &recorder{recordErr: errors.New("ddb down")}
+// G1 best-effort（对齐 Python worker，907K inflight 事故根治）：DDB record 是旁路，
+// 失败绝不能阻断 SQS 生命周期动作。record 失败时四态该干嘛还干嘛（SUCCESS 照删、
+// 失败态照 requeue），只记 record_fail(供观测)+ 保持原四态结果。
+// 根因：DDB 持续节流时若因 record 失败改判 UNKNOWN/Requeue(60)，SUCCESS 消息会无限
+// 重投堆积 inflight（Python 旧实现正是此坑，堆到 907K）。
+func TestRecordFailureSuccessStillDeletes(t *testing.T) {
+	r := &recorder{recordErr: errors.New("ddb throttled")}
 	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateSuccess}))
-	if !out.RecordFailed || out.Counted || out.State != model.StateUnknown {
-		t.Fatalf("record failure outcome=%+v", out)
+	if out.State != model.StateSuccess || !out.Counted {
+		t.Fatalf("record 失败不应改变 SUCCESS 四态结果，outcome=%+v", out)
+	}
+	if !r.deleted {
+		t.Error("★ record 失败也必须删 SUCCESS 消息（传输已成功，旁路记录无否决权）")
+	}
+	if r.requeued {
+		t.Error("SUCCESS 不应 requeue")
+	}
+	if !out.RecordFailed {
+		t.Error("应标记 RecordFailed 供观测")
+	}
+	if !r.recordFailReported {
+		t.Error("应上报 record_fail EMF 观测事件")
+	}
+}
+
+func TestRecordFailureFatalStillRequeues(t *testing.T) {
+	r := &recorder{recordErr: errors.New("ddb throttled")}
+	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+		r.effects(model.RunResult{State: model.StateFatal, ErrorClass: "src_not_found"}))
+	if out.State != model.StateFatal || !out.Counted {
+		t.Fatalf("record 失败不应改变 FATAL 四态结果，outcome=%+v", out)
 	}
 	if r.deleted {
-		t.Error("DDB 终态写失败时不能删除 SQS 消息")
+		t.Error("FATAL 不应删消息")
 	}
-	if !r.requeued || r.requeueDelay != 60 {
-		t.Errorf("DDB 终态写失败应 60s 后重试，got requeued=%v delay=%d", r.requeued, r.requeueDelay)
+	if !r.requeued || r.requeueDelay != 0 {
+		t.Errorf("★ record 失败也必须 requeue(0) 让 FATAL 烧进 DLQ，got requeued=%v delay=%d", r.requeued, r.requeueDelay)
 	}
-	if r.reportEvent.State != string(model.StateUnknown) || r.reportEvent.ErrorClass != "record_fail" {
-		t.Errorf("应上报 UNKNOWN/record_fail，got %+v", r.reportEvent)
+}
+
+func TestRecordFailureRetryableStillRequeuesWithBackoff(t *testing.T) {
+	r := &recorder{recordErr: errors.New("ddb throttled")}
+	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+		r.effects(model.RunResult{State: model.StateRetryable, ErrorClass: "src_rate_limit"}))
+	if out.State != model.StateRetryable || !out.Counted {
+		t.Fatalf("record 失败不应改变 RETRYABLE 四态结果，outcome=%+v", out)
+	}
+	if !r.requeued || r.requeueDelay != 300 {
+		t.Errorf("★ record 失败也必须按 error_class 分级退避 requeue(300)，got delay=%d", r.requeueDelay)
 	}
 }
 

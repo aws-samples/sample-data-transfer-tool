@@ -338,11 +338,13 @@ func (c *Consumer) tally(o Outcome) {
 	if o.RecordFailed {
 		c.stats.RecordFail.Add(1)
 	}
+	// RecordFail 与四态正交：已在上面独立 +1。此处不能因 RecordFailed 短路——record
+	// best-effort（G1）后，失败消息带真实四态（SUCCESS/FATAL/RETRYABLE），必须照常入四态桶。
+	// 否则 DDB 节流时成千上万条 SUCCESS 全 RecordFailed=true → Success 计数塌陷 → 污染
+	// 判活/可观测性，正是 G1 事故"旁路不污染主干"要防的。对齐 Python _tally（四态照常）。
 	switch {
 	case o.Poison:
-		c.stats.Poison.Add(1) // poison 单独计，不混进 unknown
-	case o.RecordFailed:
-		return
+		c.stats.Poison.Add(1) // poison 单独计，不混进 unknown/四态
 	case !o.Counted:
 		c.stats.Unknown.Add(1)
 	case o.State == model.StateSuccess:

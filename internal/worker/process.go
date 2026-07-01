@@ -79,16 +79,18 @@ func ProcessMessage(
 			State: model.StateFatal, ExitCode: -1,
 			ErrorClass: "poison_message", ErrorMessage: err.Error(),
 		}
+		// G1 best-effort：poison 的 record 失败同样不阻断——仍 Requeue(0) 烧进 DLQ（对齐 Python
+		// poison 路径）。旧实现 Requeue(60)+UNKNOWN 会在 DDB 节流时让 poison 消息滞留重投。
+		poisonRecFailed := false
 		if recErr := eff.Record(key, attemptTS, poison, body); recErr != nil {
-			obslog.Errorf("poison 终态写 DDB 失败: %v | key=%s | body=%.512s", recErr, key, body)
+			obslog.Errorf("poison 终态写 DDB 失败(降级 best-effort，仍走 DLQ): %v | key=%s | body=%.512s", recErr, key, body)
 			reportRecordFail(eff, queueType, instanceID, string(model.OpCopy))
-			_ = eff.Requeue(60)
-			return Outcome{State: model.StateUnknown, Counted: false, Poison: true, RecordFailed: true}
+			poisonRecFailed = true
 		}
 		_ = eff.Requeue(0)
 		// 打 ERROR 到 worker-ops（对齐 Python）：哪条消息坏了、坏在哪，不登机即可定位。
 		obslog.Errorf("poison 消息: %v | key=%s | body=%.512s", err, key, body)
-		return Outcome{State: model.StateFatal, Counted: false, Poison: true}
+		return Outcome{State: model.StateFatal, Counted: false, Poison: true, RecordFailed: poisonRecFailed}
 	}
 
 	result := eff.RunCopy(ctx, msg)
@@ -108,12 +110,17 @@ func ProcessMessage(
 	if recordKey == "" {
 		recordKey = msg.Destination
 	}
+	// G1 best-effort（对齐 Python worker，907K inflight 事故根治）：DDB record 是旁路留痕，
+	// 失败绝不能阻断下方 SQS 生命周期动作（delete/requeue）。旧实现 record 失败→Requeue(60)
+	// →UNKNOWN，在 DDB 持续节流时会让 SUCCESS 消息无限重投堆积 inflight（Python 旧版堆到 907K）。
+	// 现改为：只记日志 + record_fail 观测 + 标记 RecordFailed，四态该干嘛还干嘛往下走。
+	// 代价：丢一条 DDB 追溯记录 ≪ 消息卡死/成功对象反复重传（rcd copyfile 幂等，重跑不出错）。
+	recordFailed := false
 	if recErr := eff.Record(recordKey, attemptTS, result, recordBody); recErr != nil {
-		obslog.Errorf("终态写 DDB 失败 state=%s error_class=%s source=%s err=%v",
+		obslog.Errorf("终态写 DDB 失败(降级 best-effort，继续 SQS 生命周期) state=%s error_class=%s source=%s err=%v",
 			result.State, emptyToNone(result.ErrorClass), recordKey, recErr)
 		reportRecordFail(eff, queueType, instanceID, string(msg.Op))
-		_ = eff.Requeue(60)
-		return Outcome{State: model.StateUnknown, Counted: false, RecordFailed: true}
+		recordFailed = true
 	}
 
 	// 失败打 ERROR 到 worker-ops（对齐 Python）：不登机即可在 CW 看失败根因。
@@ -133,22 +140,22 @@ func ProcessMessage(
 				QueueType: queueType, ErrorClass: "delete_fail", InstanceID: instanceID,
 				State: string(model.StateUnknown), Op: string(msg.Op),
 			})
-			return Outcome{State: model.StateUnknown, Counted: false}
+			return Outcome{State: model.StateUnknown, Counted: false, RecordFailed: recordFailed}
 		}
 		reportResult(eff, queueType, instanceID, msg, result)
-		return Outcome{State: model.StateSuccess, Counted: true}
+		return Outcome{State: model.StateSuccess, Counted: true, RecordFailed: recordFailed}
 	case model.StateRetryable:
 		_ = eff.Requeue(classify.RetryDelaySeconds(result.ErrorClass))
 		reportResult(eff, queueType, instanceID, msg, result)
-		return Outcome{State: model.StateRetryable, Counted: true}
+		return Outcome{State: model.StateRetryable, Counted: true, RecordFailed: recordFailed}
 	case model.StateFatal:
 		_ = eff.Requeue(0)
 		reportResult(eff, queueType, instanceID, msg, result)
-		return Outcome{State: model.StateFatal, Counted: true}
+		return Outcome{State: model.StateFatal, Counted: true, RecordFailed: recordFailed}
 	default: // UNKNOWN
 		_ = eff.Requeue(0)
 		reportResult(eff, queueType, instanceID, msg, result)
-		return Outcome{State: model.StateUnknown, Counted: false}
+		return Outcome{State: model.StateUnknown, Counted: false, RecordFailed: recordFailed}
 	}
 }
 

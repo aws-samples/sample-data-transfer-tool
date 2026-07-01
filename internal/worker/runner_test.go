@@ -153,6 +153,20 @@ func TestRunCopy_Rate429Retryable(t *testing.T) {
 	}
 }
 
+// 语义锁定(G2 分析结论):copy 源不存在时,rcd copyfile RPC 返回非 200 error →
+// 判 FATAL/src_not_found(进 DLQ 留底),**不依赖 stats**。这是 rcd 架构对 Python
+// "零传输假成功"盲点的天然规避——copyfile 单文件 RPC 源缺失直接报错,不像 CLI copyto
+// 会退化成父目录空同步 exit 0 假成功。锁死此语义:防未来有人在成功路径用 transfers==0
+// 做 fatal 判定(会误伤"传成功但 stats 抖动"的正常传输,见 StatsReadFailureStillSuccess)。
+func TestRunCopy_SourceNotFoundFatalNoStatsDependency(t *testing.T) {
+	f := newFakeRCDServer(t)
+	f.errBody = "source doesn't exist" // rcd copyfile 源对象不存在
+	res := f.runner(5*time.Second).RunCopy(context.Background(), copyMsg)
+	if res.State != model.StateFatal || res.ErrorClass != "src_not_found" {
+		t.Errorf("copy 源不存在应 FATAL/src_not_found（不走假成功），got %s/%s", res.State, res.ErrorClass)
+	}
+}
+
 func TestRunCopy_DeleteNoopIdempotent(t *testing.T) {
 	f := newFakeRCDServer(t)
 	f.errBody = "object not found" // 删不存在的对象

@@ -53,3 +53,9 @@ go-worker-linux-*
 *.test
 *.out
 /coverage.txt
+
+# 运维手册/速查/脚本（含客户生产 account/ARN/ASG 物理名/拓扑，绝不入库——origin 是公开仓）
+OPS.html
+cluster-ops.html
+ops/rclone-watch.sh
+ops/watch-3pools.sh
