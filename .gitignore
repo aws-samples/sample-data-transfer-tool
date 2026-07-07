@@ -46,3 +46,10 @@ CLAUDE.md
 docs/
 deploy-params-*.json
 !deploy-params-*.json.template
+
+# 运维手册/速查/配置生成器/脚本（含客户生产 account/ARN/ASG/集群名，绝不入公开仓）
+OPS.html
+cluster-ops.html
+ratelimit-ops.html
+ops/rclone-watch.sh
+ops/watch-3pools.sh

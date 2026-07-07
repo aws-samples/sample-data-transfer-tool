@@ -354,6 +354,10 @@ class WorkerLoop:
         )
 
     def _report(self, event):
+        # METRICS_ENABLED=false 时彻底不打 EMF 行（省 CloudWatch 摄入 + 自定义指标费）。
+        # DDB 四态终态记录与本地日志不受影响，仍可追溯每条 attempt。
+        if not self.settings.metrics_enabled:
+            return
         monitoring_reporter.report(event)
 
     def _handle_one(self, msg: dict) -> None:

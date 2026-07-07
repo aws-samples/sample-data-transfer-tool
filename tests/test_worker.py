@@ -596,3 +596,35 @@ class TestResolveInstanceId:
         monkeypatch.setattr(worker, "_ec2_instance_id", lambda: "i-xyz")
         ids = {worker.resolve_instance_id({"WORKER_INDEX": str(i)}) for i in range(16)}
         assert len(ids) == 16
+
+
+class TestReportMetricsGate:
+    """METRICS_ENABLED 开关：关闭时 WorkerLoop._report 完全不调 EMF 上报。"""
+
+    def _loop(self, *, metrics_enabled):
+        from migration.config import Settings
+        from migration.worker import WorkerLoop
+
+        env = {
+            "AWS_REGION": "eu-central-1",
+            "QUEUE_URL": "http://queue",
+            "METRICS_ENABLED": "true" if metrics_enabled else "false",
+        }
+        settings = Settings.from_env(env)
+        return WorkerLoop(settings, settings.queue_url, "i-test#0", sqs=object())
+
+    def test_report_skipped_when_metrics_disabled(self, monkeypatch):
+        from migration import worker
+
+        calls = []
+        monkeypatch.setattr(worker.monitoring_reporter, "report", lambda e: calls.append(e))
+        self._loop(metrics_enabled=False)._report({"state": "SUCCESS"})
+        assert calls == []  # 关掉后一行都不打
+
+    def test_report_emitted_when_metrics_enabled(self, monkeypatch):
+        from migration import worker
+
+        calls = []
+        monkeypatch.setattr(worker.monitoring_reporter, "report", lambda e: calls.append(e))
+        self._loop(metrics_enabled=True)._report({"state": "SUCCESS"})
+        assert calls == [{"state": "SUCCESS"}]  # 默认仍上报

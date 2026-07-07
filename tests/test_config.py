@@ -20,6 +20,20 @@ def test_from_env_minimal_defaults():
     assert s.queue_url == "http://queue"
     assert s.dynamodb_table == "transfer-message-status-eu-central-1"
     assert s.queue_high_watermark == 5_000_000
+    # 默认关闭：省 CloudWatch 费用，无需改 CFN。
+    assert s.metrics_enabled is False
+
+
+@pytest.mark.parametrize("val", ["true", "True", "1", "yes", "on", " ON "])
+def test_metrics_enabled_opt_in_values(val):
+    s = Settings.from_env(_base_env() | {"METRICS_ENABLED": val})
+    assert s.metrics_enabled is True
+
+
+@pytest.mark.parametrize("val", ["false", "0", "no", "off", ""])
+def test_metrics_enabled_stays_off_values(val):
+    s = Settings.from_env(_base_env() | {"METRICS_ENABLED": val})
+    assert s.metrics_enabled is False
 
 
 def test_from_env_overrides():

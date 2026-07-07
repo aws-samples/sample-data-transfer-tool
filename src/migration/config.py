@@ -106,6 +106,10 @@ class Settings:
     # AIMD），worker 与 bwlimit 同周期刷新；读不到退化为不限。
     ratelimit_tpslimit_param: str = "/migration/ratelimit/tpslimit"
     worker_threads: int = DEFAULT_WORKER_THREADS
+    # EMF 指标总开关。默认 False（关闭）——200 台 / 百亿级文件全量迁移下 CloudWatch
+    # Logs 摄入费 + 自定义指标费达数千美元/月，默认关掉直接归零，无需改 CFN。
+    # 需观测时显式注入 METRICS_ENABLED=true 打开；关闭不影响 DDB 四态终态与本地日志。
+    metrics_enabled: bool = False
     queue_high_watermark: int = DEFAULT_QUEUE_HIGH_WATERMARK
     queue_low_watermark: int = DEFAULT_QUEUE_LOW_WATERMARK
     # 队列 VisibilityTimeout（秒），用于 C1 安全裕量校验 + H1 优雅退出语义。
@@ -139,6 +143,8 @@ class Settings:
                 "RATELIMIT_TPSLIMIT_PARAM", "/migration/ratelimit/tpslimit"
             ),
             worker_threads=int(e.get("WORKER_THREADS", str(DEFAULT_WORKER_THREADS))),
+            metrics_enabled=e.get("METRICS_ENABLED", "false").strip().lower()
+            in ("true", "1", "yes", "on"),
             queue_high_watermark=int(
                 e.get("QUEUE_HIGH_WATERMARK", str(DEFAULT_QUEUE_HIGH_WATERMARK))
             ),
