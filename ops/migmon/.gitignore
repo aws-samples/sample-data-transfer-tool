@@ -1,0 +1,4 @@
+# 编译产物,不入库(用 build.sh 现编现传 ArtifactsBucket)
+/dist/
+/migmon
+*.test
