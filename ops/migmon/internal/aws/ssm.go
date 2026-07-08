@@ -39,6 +39,40 @@ func (c *Clients) InServiceInstances(ctx context.Context, asg string) ([]string,
 	return ids, nil
 }
 
+// InstanceInfo is one ASG instance for the SSM picker (id + state + AZ).
+type InstanceInfo struct {
+	InstanceID string
+	State      string // ASG lifecycle state (InService/Pending/...)
+	AZ         string
+}
+
+// InstancesDetailed lists all instances of an ASG with lifecycle state + AZ,
+// for the "pick a machine to SSM into" overlay (not just InService).
+func (c *Clients) InstancesDetailed(ctx context.Context, asg string) ([]InstanceInfo, error) {
+	out, err := c.ASG.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
+		AutoScalingGroupNames: []string{asg},
+	})
+	if err != nil || len(out.AutoScalingGroups) == 0 {
+		return nil, err
+	}
+	var infos []InstanceInfo
+	for _, inst := range out.AutoScalingGroups[0].Instances {
+		if inst.InstanceId == nil {
+			continue
+		}
+		az := ""
+		if inst.AvailabilityZone != nil {
+			az = *inst.AvailabilityZone
+		}
+		infos = append(infos, InstanceInfo{
+			InstanceID: *inst.InstanceId,
+			State:      string(inst.LifecycleState),
+			AZ:         az,
+		})
+	}
+	return infos, nil
+}
+
 // rcloneProcScript counts running rclone copyto/copy processes.
 const rcloneProcScript = `printf "rclone_procs=%s\n" "$(pgrep -c "[r]clone (copyto|copy)" || echo 0)"`
 

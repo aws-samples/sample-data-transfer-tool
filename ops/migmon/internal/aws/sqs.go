@@ -35,6 +35,41 @@ func (c *Clients) Depth(ctx context.Context, queueURL string) QueueDepth {
 	return d
 }
 
+// QueueLine is one queue's name + depth for the "list all queues" overlay.
+type QueueLine struct {
+	Name     string
+	Pending  string
+	InFlight string
+}
+
+// AllQueues lists every queue matching prefix (incl. -dlq) with its depth.
+// Pass an empty prefix to list ALL queues in the region.
+func (c *Clients) AllQueues(ctx context.Context, prefix string) ([]QueueLine, error) {
+	urls, err := c.ListQueues(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	lines := make([]QueueLine, 0, len(urls))
+	for _, u := range urls {
+		name := u
+		if i := lastSlash(u); i >= 0 {
+			name = u[i+1:]
+		}
+		d := c.Depth(ctx, u)
+		lines = append(lines, QueueLine{Name: name, Pending: d.Pending, InFlight: d.InFlight})
+	}
+	return lines, nil
+}
+
+func lastSlash(s string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == '/' {
+			return i
+		}
+	}
+	return -1
+}
+
 // DLQDepth reads the DLQ pending count; "-" if no DLQ url.
 func (c *Clients) DLQDepth(ctx context.Context, dlqURL string) string {
 	if dlqURL == "" {
