@@ -201,7 +201,8 @@ func instanceRows(infos []maws.InstanceInfo) []table.Row {
 
 // ---- KPI banner ----
 
-// kpiBanner renders totals as big-font numbers in a bordered box spanning width.
+// kpiBanner renders the 3 headline totals as plain, precise, colored numbers
+// (thousands-separated) — no ASCII big-font. Label dim, number bold+colored.
 func (m Model) kpiBanner() string {
 	var tp, tq, td int64
 	for _, r := range m.rows {
@@ -209,19 +210,23 @@ func (m Model) kpiBanner() string {
 		tq += atoi64(r.QPSDone)
 		td += atoi64(r.DLQ)
 	}
-	cell := func(label, val string, st lipgloss.Style) string {
-		big := st.Render(bigNumber(val))
-		return lipgloss.JoinVertical(lipgloss.Left, styKPILabel.Render(label), big)
+	// 每个 KPI:标签 / 精确数字(千分位,大号加粗着色) / human 副标(84.1M)。
+	cell := func(label string, n int64, st lipgloss.Style) string {
+		return lipgloss.JoinVertical(lipgloss.Left,
+			styKPILabel.Render(label),
+			st.Render(comma(strconv.FormatInt(n, 10))),
+			styKPIHint.Render("≈ "+human(n)),
+		)
 	}
-	pending := cell("PENDING 堆积", human(tp), styKPIWarn)
-	qps := cell("QPS 完成/秒", human(tq), styKPIOK)
+	pending := cell("PENDING 堆积", tp, styKPIWarn)
+	qps := cell("QPS 完成/秒", tq, styKPIOK)
 	dlqStyle := styKPIOK
 	if td > 0 {
 		dlqStyle = styKPIErr
 	}
-	dlq := cell("DLQ 死信", human(td), dlqStyle)
+	dlq := cell("DLQ 死信", td, dlqStyle)
 
-	gap := "    "
+	gap := "      "
 	row := lipgloss.JoinHorizontal(lipgloss.Top, pending, gap, qps, gap, dlq)
 	w := m.width - 2
 	if w < 20 {

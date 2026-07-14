@@ -18,10 +18,11 @@ var (
 	styPanelFocused = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("14")).Padding(0, 1)
 	styPanelBlur    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
 
-	// KPI banner: big-number colors by semantic.
+	// KPI banner: 精确数字 + 语义色(加粗)。不用 ASCII 大字。
 	styKPILabel = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	styKPIWarn  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11"))
 	styKPIErr   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9"))
 	styKPIOK    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
+	styKPIHint  = lipgloss.NewStyle().Foreground(lipgloss.Color("244")) // human 副标(如 84.1M)
 	styKPIBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 2)
 )
