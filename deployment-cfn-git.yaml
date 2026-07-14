@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   GCS/S3 -> S3 transfer agent, SINGLE-CLUSTER template. One stack = one independent cluster
-  (own SQS queue+DLQ, DynamoDB status+heartbeat tables, AIMD rate-limit Lambda, log groups, dashboard).
+  (own SQS queue+DLQ, DynamoDB status+heartbeat tables, fixed per-host rate-limit SSM params, log groups, dashboard).
   Deploy this stack N times (one per cluster) for N independent clusters. cfn-init at boot downloads
   the prebuilt go-worker binary from a GitHub release and runs rclone-rcd + go-worker via systemd
   (rcd-based: connection-pool reuse kills per-file fork+TLS overhead). TRANSFER side only; filling SQS is separate.
@@ -14,9 +14,9 @@ Metadata:
       - Label: { default: '1) Network (customer-provided, NOT created by this stack)' }
         Parameters: [VpcId, WorkerSubnetIds, EipPoolTagKey, EipPoolTagValue]
       - Label: { default: '2) Pre-created external resources (create BEFORE deploying)' }
-        Parameters: [GcsHmacSecretArn, ArtifactsBucket, LambdaS3Key]
+        Parameters: [GcsHmacSecretArn, ArtifactsBucket]
       - Label: { default: '3) This cluster: destination & rate limit' }
-        Parameters: [TargetBucketPrefix, RatelimitTargetGbps, RatelimitTpsTarget]
+        Parameters: [TargetBucketPrefix, RatelimitBwlimit, RatelimitTpslimit]
       - Label: { default: '4) Compute capacity' }
         Parameters: [InstanceType, CpuArch, InstanceCount, WorkerCount, WorkerThreads, RootVolumeSize]
       - Label: { default: '5) Code sources (go-worker binary + rclone binary)' }
@@ -30,10 +30,9 @@ Metadata:
       EipPoolTagValue: { default: EIP pool tag value (optional) }
       GcsHmacSecretArn: { default: GCS HMAC secret ARN }
       ArtifactsBucket: { default: Ops/artifacts bucket }
-      LambdaS3Key: { default: Rate-limit Lambda zip key }
       TargetBucketPrefix: { default: Destination bucket prefix }
-      RatelimitTargetGbps: { default: Rate-limit target (Gbps) }
-      RatelimitTpsTarget: { default: Rate-limit TPS target (transactions/sec) }
+      RatelimitBwlimit: { default: Per-host rcd bwlimit (e.g. 745M or off) }
+      RatelimitTpslimit: { default: Per-host rcd tpslimit (tx/sec or off) }
       InstanceType: { default: EC2 instance type }
       CpuArch: { default: CPU architecture }
       InstanceCount: { default: Instance count (ASG desired) }
@@ -95,18 +94,9 @@ Parameters:
     Type: String
     Default: s3euprodloginventory
     Description: >-
-      Ops/artifacts bucket holding deploy artifacts under the ops/ prefix: the rate-limit Lambda zip
-      (always) and an optional self-compiled rclone binary. The worker role gets s3:GetObject on it;
-      the Lambda Code is loaded from it. Created OUTSIDE this stack (can be shared across stacks).
-      e.g. s3euprodloginventory
-  LambdaS3Key:
-    Type: String
-    Default: ops/ratelimit-controller-goworker.zip
-    Description: >-
-      S3 key of the GO-CLUSTER rate-limit Lambda zip inside ArtifactsBucket, under the ops/ prefix.
-      This build contains the rcd-mode division (per-EC2, not per-rclone-process) required by
-      go-worker. Default points at the pre-uploaded go-cluster zip.
-      e.g. ops/ratelimit-controller-goworker.zip
+      Ops/artifacts bucket holding deploy artifacts under the ops/ prefix (an optional self-compiled
+      rclone binary). The worker role gets s3:GetObject on it. Created OUTSIDE this stack
+      (can be shared across stacks). e.g. s3euprodloginventory
 
   # ═══════════════ 3) This cluster: destination & rate limit ═══════════════
   TargetBucketPrefix:
@@ -114,18 +104,20 @@ Parameters:
     Description: >-
       Destination S3 bucket-name prefix for this cluster; worker IAM write scope = arn:aws:s3:::<prefix>*.
       e.g. migration-dest-
-  RatelimitTargetGbps:
+  RatelimitBwlimit:
     Type: String
-    Default: '300'
-    Description: Fleet-wide throughput redline (Gbps) for this cluster's AIMD auto mode. 0 = unlimited. e.g. 400
-  RatelimitTpsTarget:
-    Type: String
-    Default: '10000'
+    Default: 'off'
     Description: >-
-      Fleet-wide total transactions/sec target (or 'off'). GO-CLUSTER (rcd) mode: the controller
-      Lambda divides this by the live INSTANCE count every 60s and writes the per-EC2 tpslimit (each
-      EC2 = one rcd daemon with a global TPS limit; go-worker applies it via rcd options/set). Default
-      10000 = loose cap (large files never hit it; guards small-file QPS against GCS/S3 rate limits). e.g. 10000
+      Per-host rcd global bandwidth cap, rclone --bwlimit format (e.g. 745M = 745 MiB/s), or 'off'.
+      Read ONCE at go-worker startup and applied to the local rcd daemon; no AIMD, no periodic reread.
+      Change value + roll instances to take effect. e.g. 745M
+  RatelimitTpslimit:
+    Type: String
+    Default: 'off'
+    Description: >-
+      Per-host rcd global transactions/sec cap, or 'off'. Read ONCE at go-worker startup and applied to
+      the local rcd daemon (rcd options/set). Guards small-file QPS against GCS ~5000/s read /
+      S3 ~3500/s-per-prefix PUT. Change value + roll instances to take effect. e.g. 3000
 
   # ═══════════════ 4) Compute capacity ═══════════════
   InstanceType:
@@ -182,7 +174,7 @@ Parameters:
     Default: ops/rclone-v1.74.3-x86_64
     Description: >-
       Optional FULL S3 key of a self-compiled rclone binary INSIDE ArtifactsBucket under the ops/
-      prefix (same bucket + same key-only format as LambdaS3Key). MUST match CpuArch — pick the
+      prefix (full relative key within the bucket). MUST match CpuArch — pick the
       binary for this stack's architecture yourself (x86_64 vs arm64 binaries are not interchangeable;
       a mismatch causes 'exec format error' at boot). DEFAULT is the x86_64 build (matches default
       InstanceType c8in.8xlarge); for arm64 stacks change to ops/rclone-v1.74.3-arm64. Two arch
@@ -446,7 +438,7 @@ Resources:
                 if [ -n "$RCLONE_S3_KEY" ]; then
                   # 自编译 rclone:RcloneS3Key 是完整 key(已含架构,部署时按 CpuArch 自行选对),
                   # 从 ArtifactsBucket 拉到 /usr/local/bin(优先于官网),systemd 注入 RCLONE_BIN 指向它。
-                  # 与 LambdaS3Key 同格式:都是 ArtifactsBucket 内的完整相对 key,统一一个桶。
+                  # RcloneS3Key 是 ArtifactsBucket 内的完整相对 key。
                   retry 5 aws s3 cp "s3://${ArtifactsBucket}/$RCLONE_S3_KEY" /usr/local/bin/rclone
                   chmod +x /usr/local/bin/rclone
                   /usr/local/bin/rclone version
@@ -824,128 +816,23 @@ Resources:
         - { Key: Component, Value: compute, PropagateAtLaunch: true }
         - { Key: ManagedBy, Value: cloudformation, PropagateAtLaunch: true }
 
-  RatelimitLimitEnabledSsm:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub '/migration/${AWS::StackName}/ratelimit/limit-enabled'
-      Type: String
-      Value: 'true'
-      Description: 'rate-limit master switch true|false (false=unlimited)'
-  RatelimitAutoEnabledSsm:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub '/migration/${AWS::StackName}/ratelimit/auto-enabled'
-      Type: String
-      Value: 'true'
-      Description: 'auto-adjust switch true|false (true=AIMD auto; false=manually fixed bwlimit)'
-  RatelimitTargetGbpsSsm:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub '/migration/${AWS::StackName}/ratelimit/target-gbps'
-      Type: String
-      Value: !Ref RatelimitTargetGbps
-      Description: 'fleet-wide throughput redline in Gbps (the AIMD target in auto mode)'
+  # ─────────────── 限速：每机 rcd 固定上限（2026-07-14 去动态化）───────────────
+  # 无 AIMD 控制器 Lambda、无 EventBridge、无周期重读。仅两个 SSM 参数存固定上限，
+  # go-worker 启动时读一次设给本机 rcd 全局限速，之后不变。调整靠改 SSM 值 + 滚动实例。
   RatelimitBwlimitSsm:
     Type: AWS::SSM::Parameter
     Properties:
       Name: !Sub '/migration/${AWS::StackName}/ratelimit/bwlimit'
       Type: String
-      Value: 'off'
-      Description: 'current per-process bwlimit (bytes/sec or off); overwritten by the controller in auto mode'
-  RatelimitTpsTargetSsm:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub '/migration/${AWS::StackName}/ratelimit/tpslimit-target'
-      Type: String
-      Value: !Ref RatelimitTpsTarget
-      Description: 'FLEET-WIDE total transactions/sec target (or off). Initial value from the RatelimitTpsTarget stack parameter; can be changed live via SSM afterward. GO-CLUSTER (rcd) mode: the controller Lambda divides this by the live INSTANCE count (each EC2 runs one rcd daemon with a global tpslimit, not per-rclone-process) every 60s and writes the per-EC2 value to ratelimit/tpslimit, which go-worker applies via the rcd options/set API. Default 10000 = loose cap (large files never hit it; guards small-file QPS against GCS ~5000/s read / S3 ~3500/s-per-prefix PUT limits).'
+      Value: !Ref RatelimitBwlimit
+      Description: 'per-host rcd global bwlimit (rclone --bwlimit format, e.g. 745M, or off). Fixed cap read ONCE by go-worker at startup and applied to the local rcd daemon. Change value + roll instances to take effect.'
   RatelimitTpslimitSsm:
     Type: AWS::SSM::Parameter
     Properties:
       Name: !Sub '/migration/${AWS::StackName}/ratelimit/tpslimit'
       Type: String
-      Value: 'off'
-      Description: 'per-process rclone --tpslimit (transactions/sec or off); COMPUTED by the controller Lambda each 60s = tpslimit-target / process-count. Workers re-read every 30s. Do not edit by hand — set ratelimit/tpslimit-target instead.'
-
-  # ─────────────── 限速控制平面（本栈单集群的 AIMD 控制器）───────────────
-  # 一个 Lambda + 一个 EventBridge rule，每分钟循环处理 4 个集群（配置经 CLUSTERS env 注入）。
-  # 取代了原先「每集群一个 Lambda（代码逐字复制 4 份且是 ratelimit.py 的劣化分叉）」。
-  # 控制律（AIMD + rcd 模式每-EC2 分摊）即 lambda/ratelimit_controller.py 里的纯函数，
-  # 部署=被测代码，无分叉。
-  RatelimitControllerRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${AWS::StackName}-ratelimit-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: ratelimit-control
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              # 读写本栈集群的限速 SSM 命名空间。
-              - Effect: Allow
-                Action: [ssm:GetParameter, ssm:PutParameter]
-                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/migration/*/ratelimit/*'
-              - Effect: Allow
-                Action: [cloudwatch:GetMetricData, cloudwatch:GetMetricStatistics]
-                Resource: '*'
-      Tags:
-        - { Key: Project, Value: !Ref ProjectTag }
-        - { Key: Stack, Value: !Ref 'AWS::StackName' }
-        - { Key: Component, Value: iam }
-        - { Key: ManagedBy, Value: cloudformation }
-
-  RatelimitControllerFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${AWS::StackName}-ratelimit-controller'
-      Runtime: python3.12
-      # 部署包 = lambda/ratelimit_controller.py(打 zip 传 S3，默认 LambdaS3Key 指向客户已上传的
-      # go 集群专用包 ops/ratelimit-controller-goworker.zip；打包命令见 README)。
-      Handler: ratelimit_controller.handler
-      Timeout: 120
-      Role: !GetAtt RatelimitControllerRole.Arn
-      Tags:
-        - { Key: Project, Value: !Ref ProjectTag }
-        - { Key: Stack, Value: !Ref 'AWS::StackName' }
-        - { Key: Component, Value: monitoring }
-        - { Key: ManagedBy, Value: cloudformation }
-      Environment:
-        Variables:
-          # 本栈 = 单集群。CLUSTERS 是单元素列表(name=栈名,用于拼 SSM 路径 /migration/<name>/ratelimit/*)。
-          # worker_count=0 = go-worker rcd 模式哨兵:限速除到每 EC2(rcd 全局),非每 rclone 进程。
-          CLUSTERS: !Sub |
-            [{"name":"${AWS::StackName}","asg":"${AgentASG}","threads":${WorkerThreads},"worker_count":0}]
-          SLOW_WINDOW_SEC: '300'
-          FAST_WINDOW_SEC: '60'
-          EMF_NAMESPACE: 'GcsS3Migration'
-      Code:
-        S3Bucket: !Ref ArtifactsBucket
-        S3Key: !Ref LambdaS3Key
-
-  RatelimitSchedule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub '${AWS::StackName}-ratelimit-60s'
-      ScheduleExpression: 'rate(1 minute)'
-      State: ENABLED
-      Targets:
-        - Id: ratelimit
-          Arn: !GetAtt RatelimitControllerFunction.Arn
-  RatelimitSchedulePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref RatelimitControllerFunction
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt RatelimitSchedule.Arn
+      Value: !Ref RatelimitTpslimit
+      Description: 'per-host rcd global tpslimit (transactions/sec, or off). Fixed cap read ONCE by go-worker at startup. Change value + roll instances to take effect.'
 
   # ─────────────────────────── Dashboard (this stack's single cluster) ───────────────────────────
   MigrationDashboard:

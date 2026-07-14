@@ -41,10 +41,10 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	obslog.Infof("rcd 就绪 @ %s", cfg.RCDAddr)
 
-	// 限速刷新（每 60s 从 SSM 读 → 设 rcd 全局 core/bwlimit + options/set TPSLimit）。
-	// 60s 与控制器 Lambda 写频率对齐（读写同频）。
-	rl := ratelimit.New(ssmClient, rcdClient, cfg.BwlimitParam, cfg.TpslimitParam)
-	go rl.Run(ctx, 60*time.Second)
+	// 限速：启动时从 SSM 读一次固定上限（bwlimit/tpslimit）设给 rcd 全局，之后不再变动。
+	// 无 AIMD 控制器 Lambda、无周期重读——每机 rcd 一个固定上限；调整靠改 SSM + 滚动实例。
+	// 非阻断：读取/设置失败该项退化为不限速，不影响启动。
+	ratelimit.New(ssmClient, rcdClient, cfg.BwlimitParam, cfg.TpslimitParam).ApplyOnce(ctx)
 
 	// runner：同步 copyfile，ctx deadline = RCLONE_TIMEOUT（HTTP 断开即中止，防双写）。
 	// GroupPoolSize=Workers：每个并发传输借一个独立 stats group，group 总数恒定=Workers，

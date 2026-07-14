@@ -43,60 +43,67 @@ func (f *fakeLimiter) SetTPSLimit(_ context.Context, tps float64) error {
 	return nil
 }
 
-func TestRefreshInitialReadFailSetsOff(t *testing.T) {
+// ApplyOnce 读到有效值时设给 rcd（各调一次）。
+func TestApplyOnceSetsValues(t *testing.T) {
+	ssmClient := &fakeSSM{values: map[string]string{"/bw": "745M", "/tps": "156.25"}, errs: map[string]error{}}
+	limiter := &fakeLimiter{}
+	New(ssmClient, limiter, "/bw", "/tps").ApplyOnce(context.Background())
+
+	if len(limiter.bw) != 1 || limiter.bw[0] != "745M" {
+		t.Fatalf("bwlimit 应设为 745M 一次，got %v", limiter.bw)
+	}
+	if len(limiter.tps) != 1 || limiter.tps[0] != 156.25 {
+		t.Fatalf("tpslimit 应设为 156.25 一次，got %v", limiter.tps)
+	}
+}
+
+// 读取失败 → 该项 off（bwlimit=off / tps=0）。
+func TestApplyOnceReadFailSetsOff(t *testing.T) {
 	ssmClient := &fakeSSM{
 		values: map[string]string{},
-		errs: map[string]error{
-			"/bw":  errors.New("ssm down"),
-			"/tps": errors.New("ssm down"),
-		},
+		errs:   map[string]error{"/bw": errors.New("ssm down"), "/tps": errors.New("ssm down")},
 	}
 	limiter := &fakeLimiter{}
-	r := New(ssmClient, limiter, "/bw", "/tps")
-	r.refresh(context.Background())
+	New(ssmClient, limiter, "/bw", "/tps").ApplyOnce(context.Background())
+
 	if len(limiter.bw) != 1 || limiter.bw[0] != "off" {
-		t.Fatalf("初始 bwlimit 读取失败应设 off，got %v", limiter.bw)
+		t.Fatalf("bwlimit 读取失败应设 off，got %v", limiter.bw)
 	}
 	if len(limiter.tps) != 1 || limiter.tps[0] != 0 {
-		t.Fatalf("初始 tpslimit 读取失败应设 0，got %v", limiter.tps)
+		t.Fatalf("tpslimit 读取失败应设 0(off)，got %v", limiter.tps)
 	}
 }
 
-func TestRefreshReadFailPreservesLastValue(t *testing.T) {
-	ssmClient := &fakeSSM{values: map[string]string{"/bw": "100M", "/tps": "10"}, errs: map[string]error{}}
+// 空值 → off。
+func TestApplyOnceEmptyValueSetsOff(t *testing.T) {
+	ssmClient := &fakeSSM{values: map[string]string{"/bw": "", "/tps": ""}, errs: map[string]error{}}
 	limiter := &fakeLimiter{}
-	r := New(ssmClient, limiter, "/bw", "/tps")
-	r.refresh(context.Background())
+	New(ssmClient, limiter, "/bw", "/tps").ApplyOnce(context.Background())
 
-	ssmClient.mu.Lock()
-	ssmClient.errs["/bw"] = errors.New("ssm down")
-	ssmClient.errs["/tps"] = errors.New("ssm down")
-	ssmClient.mu.Unlock()
-	r.refresh(context.Background())
+	if limiter.bw[0] != "off" || limiter.tps[0] != 0 {
+		t.Fatalf("空值应设 off，got bw=%v tps=%v", limiter.bw, limiter.tps)
+	}
+}
+
+// tpslimit 非法 → 不调用 rcd 的 SetTPSLimit（该项跳过，退化不限）。
+func TestApplyOnceInvalidTPSSkips(t *testing.T) {
+	ssmClient := &fakeSSM{values: map[string]string{"/bw": "100M", "/tps": "bad"}, errs: map[string]error{}}
+	limiter := &fakeLimiter{}
+	New(ssmClient, limiter, "/bw", "/tps").ApplyOnce(context.Background())
 
 	if len(limiter.bw) != 1 || limiter.bw[0] != "100M" {
-		t.Fatalf("bwlimit 读取失败应保留旧值且不重复设置，got %v", limiter.bw)
+		t.Fatalf("bwlimit 应正常设 100M，got %v", limiter.bw)
 	}
-	if len(limiter.tps) != 1 || limiter.tps[0] != 10 {
-		t.Fatalf("tpslimit 读取失败应保留旧值且不重复设置，got %v", limiter.tps)
+	if len(limiter.tps) != 0 {
+		t.Fatalf("非法 tpslimit 不应调用 rcd，got %v", limiter.tps)
 	}
 }
 
-func TestRefreshInvalidTPSDoesNotOverwriteLastValue(t *testing.T) {
-	ssmClient := &fakeSSM{values: map[string]string{"/bw": "100M", "/tps": "10"}, errs: map[string]error{}}
+// 参数名为空 → off（不读 SSM）。
+func TestApplyOnceEmptyParamNameSetsOff(t *testing.T) {
 	limiter := &fakeLimiter{}
-	r := New(ssmClient, limiter, "/bw", "/tps")
-	r.refresh(context.Background())
-
-	ssmClient.mu.Lock()
-	ssmClient.values["/tps"] = "bad"
-	ssmClient.mu.Unlock()
-	r.refresh(context.Background())
-
-	if r.lastTps != "10" {
-		t.Fatalf("非法 tpslimit 不应覆盖 lastTps，got %q", r.lastTps)
-	}
-	if len(limiter.tps) != 1 {
-		t.Fatalf("非法 tpslimit 不应调用 rcd，got %v", limiter.tps)
+	New(&fakeSSM{values: map[string]string{}, errs: map[string]error{}}, limiter, "", "").ApplyOnce(context.Background())
+	if limiter.bw[0] != "off" || limiter.tps[0] != 0 {
+		t.Fatalf("空参数名应设 off，got bw=%v tps=%v", limiter.bw, limiter.tps)
 	}
 }
