@@ -163,12 +163,12 @@ Parameters:
       static binary). e.g. https://github.com/aws-samples/sample-data-transfer-tool
   GoWorkerReleaseTag:
     Type: String
-    Default: go-worker-v0.1.0-528a3c3
+    Default: go-worker-v0.5.0
     Description: >-
       Release tag whose assets hold the go-worker binary. cfn-init downloads
       go-worker-linux-<arch> (arch from CpuArch) from
       <GitRepoUrl>/releases/download/<tag>/go-worker-linux-<arch>. Must be a PUBLISHED release.
-      e.g. go-worker-v0.1.0-528a3c3
+      e.g. go-worker-v0.5.0
   RcloneS3Key:
     Type: String
     Default: ops/rclone-v1.74.3-x86_64
