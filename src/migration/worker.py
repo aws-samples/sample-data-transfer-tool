@@ -679,12 +679,14 @@ class WorkerLoop:
             s["delete_ok"], s["delete_fail"], s["swallowed"],
         )
 
-    def _ratelimit_loop(self, *, interval: float = 30.0) -> None:
+    def _ratelimit_loop(self, *, interval: float = 3600.0) -> None:
         """后台限速刷新：每 interval 秒从 SSM 读 bwlimit + tpslimit，更新本地快照。
 
-        worker 端极简——bwlimit 由控制器 Lambda（AIMD）写、worker 只读；tpslimit
-        由运维手动写 SSM、worker 同周期读（30s < 1min，改 SSM 后约半分钟内被各
-        节点取到新值）。读失败 read_ssm_limit 已 fail-safe 返回 "off"（不限），不卡传输。
+        限速功能已停用（2026-07-14）：不再依赖 AIMD/手动 SSM 动态调速，故把刷新周期
+        从 30s 降到 3600s（1 小时），大幅减少每节点对 SSM GetParameter 的调用量
+        （原 30s×2 参数 = 每小时 240 次/节点 → 现每小时 2 次/节点，省 ~99%）。
+        保留低频轮询而非彻底移除：万一后续需临时下发限速，改 SSM 后 1 小时内仍会生效。
+        读失败 read_ssm_limit 已 fail-safe 返回 "off"（不限），不卡传输。
         仅影响之后新起的 rclone 进程；在跑进程保持原速（层次 1）。
         """
         from . import aws_clients, ratelimit

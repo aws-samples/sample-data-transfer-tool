@@ -455,7 +455,7 @@ sudo journalctl -u 'rclone-agent@*' -f
 
 ## 9. 自适应限速
 
-限速分**两个正交维度**，都由每栈一个 `${StackName}-ratelimit-controller` Lambda（EventBridge 每分钟触发）计算，写入本栈 SSM；worker 每 30s 重读，**仅在启动新 rclone 进程时**快照（在跑的传输保持原速率，避免中途变速）。SSM 不可读时 worker 一律退化为不限速（fail-safe，限速故障不阻断传输）。
+限速分**两个正交维度**，都由每栈一个 `${StackName}-ratelimit-controller` Lambda（EventBridge 每分钟触发）计算，写入本栈 SSM；worker 每 1h 重读（限速已停用，2026-07-14 从 30s 降频省 SSM 调用），**仅在启动新 rclone 进程时**快照（在跑的传输保持原速率，避免中途变速）。SSM 不可读时 worker 一律退化为不限速（fail-safe，限速故障不阻断传输）。
 
 | 维度 | rclone flag | 限什么 | 防什么 | 计算方式 |
 |------|------------|--------|--------|---------|

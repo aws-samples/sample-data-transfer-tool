@@ -760,7 +760,7 @@ Resources:
       Name: !Sub '/migration/${AWS::StackName}/ratelimit/tpslimit'
       Type: String
       Value: 'off'
-      Description: 'per-process rclone --tpslimit (transactions/sec or off); COMPUTED by the controller Lambda each 60s = tpslimit-target / process-count. Workers re-read every 30s. Do not edit by hand — set ratelimit/tpslimit-target instead.'
+      Description: 'per-process rclone --tpslimit (transactions/sec or off); COMPUTED by the controller Lambda each 60s = tpslimit-target / process-count. Workers re-read every 1h (ratelimit disabled 2026-07-14, downshifted from 30s to cut SSM GetParameter calls). Do not edit by hand — set ratelimit/tpslimit-target instead.'
 
   # ─────────────── 限速控制平面（本栈单集群的 AIMD 控制器）───────────────
   # 一个 Lambda + 一个 EventBridge rule，每分钟循环处理 4 个集群（配置经 CLUSTERS env 注入）。
