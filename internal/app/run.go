@@ -61,8 +61,13 @@ func Run(ctx context.Context, cfg Config) error {
 	go heartbeatLoop(ctx, store, cfg.InstanceID, cfg.Workers)
 	go progressLoop(ctx, stats)
 
-	report := func(ev worker.EMFEvent) {
-		_ = emf.Emit(ev, func(s string) { fmt.Println(s) })
+	// EMF 指标默认关（MetricsEnabled=false）——不打 EMF,省 CloudWatch 摄入+指标费,对齐 Python。
+	// 需观测时设 METRICS_ENABLED=true 打开。四态计数/DDB 终态/ops 日志不受影响。
+	report := func(ev worker.EMFEvent) {}
+	if cfg.MetricsEnabled {
+		report = func(ev worker.EMFEvent) {
+			_ = emf.Emit(ev, func(s string) { fmt.Println(s) })
+		}
 	}
 
 	consumer := worker.NewConsumer(sqsClient, worker.ConsumerConfig{

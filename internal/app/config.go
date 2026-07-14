@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config 运行时配置，从环境变量解析（对齐 Python config.Settings 注入约定）。
@@ -25,6 +26,7 @@ type Config struct {
 	RcloneTimeout   int    // 秒，HTTP 传输 deadline
 	VisibilityTO    int    // 秒，SQS VisibilityTimeout
 	OpsLogPath      string // worker-ops 分级日志路径（WARNING+ 落盘供 CW 采集）
+	MetricsEnabled  bool   // EMF 指标总开关，默认 false（关）——对齐 Python，省 CloudWatch 费用
 }
 
 // timeoutVisibilitySafeRatio rclone timeout ≤ 0.7×visibility（防双写，对齐 Python）。
@@ -107,6 +109,7 @@ func FromEnv(getenv func(string) string) (Config, error) {
 		RcloneTimeout:   rcloneTimeout, // 0.7×43200
 		VisibilityTO:    visibilityTO,
 		OpsLogPath:      orDefault(getenv("OPS_LOG_PATH"), "/var/log/migration/worker-ops-0.log"),
+		MetricsEnabled:  parseBool(getenv("METRICS_ENABLED")), // 默认 false（关 EMF），对齐 Python
 	}
 
 	if err := c.validateTimeoutInvariant(); err != nil {
@@ -148,6 +151,17 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// parseBool 解析布尔环境变量：true/1/yes/on(大小写不敏感)→ true；其余(含空)→ false。
+// 与 Python config METRICS_ENABLED 解析语义一致。
+func parseBool(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // Getenv os.Getenv 包装（main 用）。

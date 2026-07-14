@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   GCS/S3 -> S3 transfer agent, SINGLE-CLUSTER template. One stack = one independent cluster
-  (own SQS queue+DLQ, DynamoDB status+heartbeat tables, fixed per-host rate-limit SSM params, log groups, dashboard).
+  (own SQS queue+DLQ, DynamoDB status+heartbeat tables, fixed per-host rate-limit SSM params, log groups).
   Deploy this stack N times (one per cluster) for N independent clusters. cfn-init at boot downloads
   the prebuilt go-worker binary from a GitHub release and runs rclone-rcd + go-worker via systemd
   (rcd-based: connection-pool reuse kills per-file fork+TLS overhead). TRANSFER side only; filling SQS is separate.
@@ -834,114 +834,6 @@ Resources:
       Value: !Ref RatelimitTpslimit
       Description: 'per-host rcd global tpslimit (transactions/sec, or off). Fixed cap read ONCE by go-worker at startup. Change value + roll instances to take effect.'
 
-  # ─────────────────────────── Dashboard (this stack's single cluster) ───────────────────────────
-  MigrationDashboard:
-    Type: AWS::CloudWatch::Dashboard
-    Properties:
-      DashboardName: !Sub '${AWS::StackName}-dashboard'
-      DashboardBody: !Sub |
-        {
-          "widgets": [
-            {
-              "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
-              "properties": { "markdown": "# ${AWS::StackName} - cluster dashboard - monitoring only, no alarms" }
-            },
-            {
-              "type": "metric", "x": 0, "y": 1, "width": 12, "height": 6,
-              "properties": {
-                "title": "Throughput (Gbps): NetworkIn=GCS download / NetworkOut=S3 upload",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": false,
-                "metrics": [
-                  [ "AWS/EC2", "NetworkIn", "AutoScalingGroupName", "${AgentASG}", { "stat": "Sum", "period": 60, "id": "ni", "visible": false } ],
-                  [ "AWS/EC2", "NetworkOut", "AutoScalingGroupName", "${AgentASG}", { "stat": "Sum", "period": 60, "id": "no", "visible": false } ],
-                  [ { "expression": "ni/60*8/1e9", "label": "NetworkIn Gbps" } ],
-                  [ { "expression": "no/60*8/1e9", "label": "NetworkOut Gbps" } ]
-                ],
-                "yAxis": { "left": { "label": "Gbps", "showUnits": false } },
-                "period": 60
-              }
-            },
-            {
-              "type": "metric", "x": 12, "y": 1, "width": 12, "height": 6,
-              "properties": {
-                "title": "Queue backlog / in-flight (SQS cap 120k/queue)",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": false,
-                "metrics": [
-                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${MigrationQueue.QueueName}", { "label": "Pending", "stat": "Maximum" } ],
-                  [ "AWS/SQS", "ApproximateNumberOfMessagesNotVisible", "QueueName", "${MigrationQueue.QueueName}", { "label": "In-flight", "stat": "Maximum" } ]
-                ],
-                "annotations": { "horizontal": [ { "label": "single-queue cap 115k", "value": 115000, "color": "#d62728" } ] },
-                "period": 60
-              }
-            },
-            {
-              "type": "metric", "x": 0, "y": 7, "width": 8, "height": 6,
-              "properties": {
-                "title": "DLQ depth",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": false,
-                "metrics": [
-                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${MigrationDLQ.QueueName}", { "label": "DLQ", "stat": "Maximum", "color": "#d62728" } ]
-                ],
-                "period": 60
-              }
-            },
-            {
-              "type": "metric", "x": 8, "y": 7, "width": 8, "height": 6,
-              "properties": {
-                "title": "ASG instances",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": false,
-                "metrics": [
-                  [ "AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${AgentASG}", { "label": "InService", "stat": "Average" } ],
-                  [ "AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", "${AgentASG}", { "label": "Desired", "stat": "Average" } ]
-                ],
-                "period": 60
-              }
-            },
-            {
-              "type": "metric", "x": 16, "y": 7, "width": 8, "height": 6,
-              "properties": {
-                "title": "Worker CPU / memory % (ASG avg)",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": false,
-                "metrics": [
-                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${AgentASG}", { "label": "CPU %", "stat": "Average" } ],
-                  [ "CWAgent", "mem_used_percent", "AutoScalingGroupName", "${AgentASG}", { "label": "mem %", "stat": "Average" } ]
-                ],
-                "yAxis": { "left": { "min": 0, "max": 100 } },
-                "period": 60
-              }
-            },
-            {
-              "type": "metric", "x": 0, "y": 13, "width": 12, "height": 6,
-              "properties": {
-                "title": "Four-state attempts/min by State (EMF AttemptCount)",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": true,
-                "metrics": [
-                  [ { "expression": "SEARCH('{GcsS3Migration,State} MetricName=\"AttemptCount\"', 'Sum', 60)", "id": "st1", "region": "${AWS::Region}" } ]
-                ],
-                "period": 60
-              }
-            },
-            {
-              "type": "metric", "x": 12, "y": 13, "width": 12, "height": 6,
-              "properties": {
-                "title": "Source throttle signal: RETRYABLE by ErrorClass (src_rate_limit = GCS 429)",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": true,
-                "metrics": [
-                  [ { "expression": "SEARCH('{GcsS3Migration,ErrorClass,State} State=\"RETRYABLE\" MetricName=\"AttemptCount\"', 'Sum', 60)", "id": "rc1", "region": "${AWS::Region}" } ]
-                ],
-                "period": 60
-              }
-            }
-          ]
-        }
-
 Outputs:
   VpcId:
     Description: VPC used for deployment.
@@ -953,9 +845,6 @@ Outputs:
   WorkerLogGroup:
     Description: Shared EMF metrics log group (CloudWatch auto-extracts the GcsS3Migration namespace).
     Value: !Ref WorkerLogGroup
-  DashboardUrl:
-    Description: Single CloudWatch dashboard for all 4 clusters.
-    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-dashboard'
 
   # ── this cluster ──
   QueueUrl: { Value: !Ref MigrationQueue }

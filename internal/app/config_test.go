@@ -23,6 +23,33 @@ func TestFromEnv_Defaults(t *testing.T) {
 	if c.RCDAddr != "127.0.0.1:5572" {
 		t.Errorf("默认 rcd addr 错: %s", c.RCDAddr)
 	}
+	if c.MetricsEnabled {
+		t.Error("MetricsEnabled 默认应为 false（关 EMF）")
+	}
+}
+
+func TestFromEnv_MetricsEnabled(t *testing.T) {
+	base := map[string]string{"AWS_REGION": "eu-south-2", "QUEUE_URL": "q"}
+	on := []string{"true", "1", "yes", "on", "TRUE", " On "}
+	for _, v := range on {
+		env := map[string]string{"AWS_REGION": "eu-south-2", "QUEUE_URL": "q", "METRICS_ENABLED": v}
+		c, err := FromEnv(envMap(env))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !c.MetricsEnabled {
+			t.Errorf("METRICS_ENABLED=%q 应为 true", v)
+		}
+	}
+	off := []string{"", "false", "0", "no", "off", "garbage"}
+	for _, v := range off {
+		env := map[string]string{"AWS_REGION": "eu-south-2", "QUEUE_URL": "q", "METRICS_ENABLED": v}
+		c, _ := FromEnv(envMap(env))
+		if c.MetricsEnabled {
+			t.Errorf("METRICS_ENABLED=%q 应为 false", v)
+		}
+	}
+	_ = base
 }
 
 func TestFromEnv_PositiveIntsFailFast(t *testing.T) {
