@@ -9,6 +9,7 @@ package ratelimit
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -41,50 +42,52 @@ func New(ssmClient SSMAPI, limiter RCDLimiter, bwlimitParam, tpslimitParam strin
 }
 
 // ApplyOnce 从 SSM 读一次 bwlimit + tpslimit，设给 rcd 全局限速。
-// 幂等且非阻断：任一读取/设置失败只告警（该项退化为不限速），不返回错误、不影响启动。
-func (l *Limiter) ApplyOnce(ctx context.Context) {
-	l.applyBw(ctx, l.read(ctx, l.bwlimitParam))   // "off" 或 "745M"
-	l.applyTPS(ctx, l.read(ctx, l.tpslimitName))  // "off" 或 "156.25"
-}
-
-func (l *Limiter) applyBw(ctx context.Context, bw string) {
+// ApplyOnce 从 SSM 读一次 bwlimit + tpslimit 设给 rcd 全局。**fail-fast 语义**（硬红线）:
+// 任一步失败返回 error,由调用方 fail-fast（worker 不启动）——限速是必须的红线,漏限=打爆
+// 源端配额/429,宁可实例起不来也不裸奔无 cap。仅当参数明确为 off/空(运维有意不限)才放行。
+//   - 参数名为空 或 SSM 值为 "off"/空:明确不限速,正常返回 nil。
+//   - 读 SSM 失败 / 值非法 / SetBwLimit|SetTPSLimit 失败:返回 error → 启动中止。
+func (l *Limiter) ApplyOnce(ctx context.Context) error {
+	bw, err := l.read(ctx, l.bwlimitParam)
+	if err != nil {
+		return fmt.Errorf("读取 bwlimit: %w", err)
+	}
 	if err := l.rcd.SetBwLimit(ctx, bw); err != nil {
-		obslog.Warnf("设 rcd bwlimit=%s 失败（本机不限带宽）: %v", bw, err)
-		return
+		return fmt.Errorf("设 rcd bwlimit=%s: %w", bw, err)
 	}
 	obslog.Infof("rcd bwlimit 已设为 %s", bw)
-}
 
-func (l *Limiter) applyTPS(ctx context.Context, tps string) {
+	tps, err := l.read(ctx, l.tpslimitName)
+	if err != nil {
+		return fmt.Errorf("读取 tpslimit: %w", err)
+	}
 	v := 0.0
 	if tps != "off" {
-		f, err := strconv.ParseFloat(tps, 64)
-		if err != nil {
-			obslog.Warnf("SSM tpslimit 非法（本机不限 TPS）: value=%q err=%v", tps, err)
-			return
+		f, perr := strconv.ParseFloat(tps, 64)
+		if perr != nil {
+			return fmt.Errorf("tpslimit 值非法 %q: %w", tps, perr)
 		}
 		v = f
 	}
 	if err := l.rcd.SetTPSLimit(ctx, v); err != nil {
-		obslog.Warnf("设 rcd tpslimit=%v 失败（本机不限 TPS）: %v", v, err)
-		return
+		return fmt.Errorf("设 rcd tpslimit=%v: %w", v, err)
 	}
 	obslog.Infof("rcd tpslimit 已设为 %s", tps)
+	return nil
 }
 
-// read 读单个 SSM 参数；参数名为空、值为空、或读取失败一律视作 "off"（不限速）。
-// 启动读一次场景下失败即 off——不保留旧值（无旧值可留），运维保证 SSM 有正确固定上限。
-func (l *Limiter) read(ctx context.Context, name string) string {
+// read 读单个 SSM 参数。参数名为空 → "off"(运维有意不限,正常)。值为空 → "off"。
+// **读取失败返回 error**(硬红线:配了参数名却读不到 SSM,不能假装不限速裸奔)。
+func (l *Limiter) read(ctx context.Context, name string) (string, error) {
 	if name == "" {
-		return "off"
+		return "off", nil
 	}
 	out, err := l.ssm.GetParameter(ctx, &ssm.GetParameterInput{Name: aws.String(name)})
 	if err != nil {
-		obslog.Warnf("读取 SSM %s 失败，视作 off: %v", name, err)
-		return "off"
+		return "", fmt.Errorf("SSM GetParameter %s: %w", name, err)
 	}
 	if out.Parameter == nil || out.Parameter.Value == nil || *out.Parameter.Value == "" {
-		return "off"
+		return "off", nil
 	}
-	return *out.Parameter.Value
+	return *out.Parameter.Value, nil
 }

@@ -43,8 +43,11 @@ func Run(ctx context.Context, cfg Config) error {
 
 	// 限速：启动时从 SSM 读一次固定上限（bwlimit/tpslimit）设给 rcd 全局，之后不再变动。
 	// 无 AIMD 控制器 Lambda、无周期重读——每机 rcd 一个固定上限；调整靠改 SSM + 滚动实例。
-	// 非阻断：读取/设置失败该项退化为不限速，不影响启动。
-	ratelimit.New(ssmClient, rcdClient, cfg.BwlimitParam, cfg.TpslimitParam).ApplyOnce(ctx)
+	// fail-fast（硬红线）：读/设失败 → 启动中止。限速是必须的红线,漏限=打爆源端配额/429,
+	// 宁可实例起不来也不裸奔无 cap。仅当 SSM 明确为 off/空(运维有意不限)才放行。
+	if err := ratelimit.New(ssmClient, rcdClient, cfg.BwlimitParam, cfg.TpslimitParam).ApplyOnce(ctx); err != nil {
+		return fmt.Errorf("限速初始化失败（fail-fast,拒绝无 cap 裸奔）: %w", err)
+	}
 
 	// runner：同步 copyfile，ctx deadline = RCLONE_TIMEOUT（HTTP 断开即中止，防双写）。
 	// GroupPoolSize=Workers：每个并发传输借一个独立 stats group，group 总数恒定=Workers，

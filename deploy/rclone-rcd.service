@@ -21,7 +21,7 @@ ExecStart=/usr/local/bin/rclone rcd \
   --config ${RCLONE_CONFIG} \
   --rc-job-expire-duration 1m \
   --transfers ${RCLONE_TRANSFERS} \
-  --s3-upload-cutoff 100M --s3-chunk-size 64M --s3-upload-concurrency 16 \
+  --s3-upload-cutoff 100M --s3-chunk-size 64M --s3-upload-concurrency 8 \
   --buffer-size 32M --max-buffer-memory 2G --use-mmap \
   --header-upload "x-amz-checksum-algorithm: CRC32C" \
   --header-upload "x-amz-checksum-type: FULL_OBJECT" \
