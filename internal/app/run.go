@@ -59,6 +59,13 @@ func Run(ctx context.Context, cfg Config) error {
 	store := status.NewStore(ddbClient, cfg.StatusTable, cfg.HeartbeatTable)
 	stats := &worker.Stats{}
 
+	// 终态记录异步批量 writer：RecordTerminal 入队即返回（不拖 SQS 生命周期），writer goroutine
+	// 攒批 BatchWriteItem（25 条/批 + UnprocessedItems 退避重试）。队列满/批写终败 → RecordFail++。
+	// StopWriter 在 consumer.Run 返回后（workers 全部 drain 完）显式调用，排空队列 + 末批 flush；
+	// defer 兜底防提前 return 泄漏 writer goroutine（StopWriter 幂等，重复调用安全）。
+	store.StartWriter(func(n int64) { stats.RecordFail.Add(n) })
+	defer store.StopWriter()
+
 	// 心跳 + 进度日志。
 	go heartbeatLoop(ctx, store, cfg.InstanceID, cfg.Workers)
 	go progressLoop(ctx, stats)
@@ -85,7 +92,10 @@ func Run(ctx context.Context, cfg Config) error {
 
 	obslog.Infof("worker 启动: %d receivers / %d workers / rclone_transfers=%d → %s",
 		cfg.Receivers, cfg.Workers, cfg.RcloneTransfers, cfg.QueueURL)
-	consumer.Run(ctx) // 阻塞到 ctx 取消后优雅 drain
+	consumer.Run(ctx) // 阻塞到 ctx 取消后优雅 drain（workers 全部结束）
+	// 先停 writer（排空终态队列 + 末批 flush），使 drain 阶段批写失败的 RecordFail 增量
+	// 计入下方停机汇总；否则 defer 的 StopWriter 会在汇总日志之后才执行，漏报这部分。
+	store.StopWriter()
 	obslog.Infof("worker 已停止 | total=%d success=%d retryable=%d fatal=%d unknown=%d poison=%d record_fail=%d delete_fail=%d requeue_fail=%d",
 		stats.Total.Load(), stats.Success.Load(), stats.Retryable.Load(), stats.Fatal.Load(),
 		stats.Unknown.Load(), stats.Poison.Load(), stats.RecordFail.Load(), stats.DeleteFail.Load(), stats.RequeueFail.Load())
