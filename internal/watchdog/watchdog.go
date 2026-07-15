@@ -78,20 +78,28 @@ type healthState struct {
 //	activity      本轮 rcd 全局活性指纹(bytes+transfers+errors 等的组合)
 //	probeOK       本轮活性探测是否成功(rcd 短暂不可达=false)
 //
-// 规则：轮询推进 或 活性指纹变化 → 判活(stall 归零)；探测失败 → 中性续命(不累计 stall);
-// 两信号同冻结 → stall++,达到 maxStall 才停报。用"指纹不等(!=)"而非"递增":固定 group 池
-// 传输前 reset 会让全局汇总回退,故不能依赖单调递增——真卡死时指纹绝对冻结。
+// 规则：轮询推进 或 活性指纹变化 → 判活(stall 归零)。探测失败 → 退化为仅轮询单信号:轮询推进
+// 续命(吸收单次 rcd 抖动)、轮询也冻结则 stall++(不能无条件续命,否则 worker 全卡在 rcd HTTP +
+// rcd 不可达时永判健康——这正是本包设计要消灭的盲点)。两信号同冻结 → stall++,达 maxStall 才停报。
+// 用"指纹不等(!=)"而非"递增":固定 group 池传输前 reset 会让全局汇总回退,故不能依赖单调递增——
+// 真卡死时指纹绝对冻结。
 func (h *healthState) evalTick(poll, activity int64, probeOK bool) bool {
 	pollAdvanced := poll > h.lastPoll
 	h.lastPoll = poll
 
 	if !probeOK {
-		// rcd 短暂不可达:不更新活性基准,不累计 stall(中性),续命一轮避免单次探测失败
-		// 把健康机推向 systemd 边界。但若同时轮询也冻结,仍续命(stall 不增)。
+		// rcd 探测失败:活性信号不可用,只能靠轮询单信号判活。不更新活性基准(无效数据不污染)。
+		//   - 轮询推进 → 健康,stall 归零续命(单次 rcd 抖动不误杀健康机)。
+		//   - 轮询也冻结 → 两信号皆无进展,累计 stall。连续 maxStall 轮"rcd 不可达 + 轮询冻结"
+		//     (= worker 全卡在 rcd 同步 HTTP → slot 不释放 → receiveLoop 停推 progress)才停报,
+		//     让 systemd 重启。修复原盲点:旧实现此处无条件续命,worker 全卡 + rcd 挂时永判健康
+		//     (与本包顶部 docstring 声称已修的正是此盲点自相矛盾)。
 		if pollAdvanced {
 			h.stallCount = 0
+			return true
 		}
-		return true
+		h.stallCount++
+		return h.stallCount < h.maxStall
 	}
 
 	activityChanged := h.haveActivity && activity != h.lastActivity

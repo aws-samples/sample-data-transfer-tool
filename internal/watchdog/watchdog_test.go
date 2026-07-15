@@ -51,17 +51,35 @@ func TestEvalTick_IdlePollAdvancingStaysAlive(t *testing.T) {
 	}
 }
 
-// T4 rcd 短暂不可达:探测失败(!ok)应视为中性,续命一轮,不把单次探测失败推向 systemd 边界。
-func TestEvalTick_ProbeFailureIsNeutral(t *testing.T) {
+// T4a rcd 探测失败但轮询仍推进:退化为轮询单信号判活,续命且 stall 归零
+// (单次/短暂 rcd 抖动不该误杀仍在正常拉取消息的健康机)。
+func TestEvalTick_ProbeFailurePollAdvancingStaysAlive(t *testing.T) {
 	h := &healthState{maxStall: testMaxStall, lastPoll: 100, lastActivity: 500, haveActivity: true}
-	// 轮询冻结 + 探测失败 → 续命(中性),且不累计 stall。
+	poll := int64(100)
 	for i := 0; i < testMaxStall+2; i++ {
-		if !h.evalTick(100, 0, false) {
-			t.Fatalf("第 %d 轮:探测失败应中性续命,不应停报", i)
+		poll++ // 轮询推进
+		if !h.evalTick(poll, 0, false) {
+			t.Fatalf("第 %d 轮:探测失败但轮询推进应续命", i)
 		}
 	}
 	if h.stallCount != 0 {
-		t.Errorf("探测失败不应累计 stallCount,got %d", h.stallCount)
+		t.Errorf("轮询推进时不应累计 stallCount,got %d", h.stallCount)
+	}
+}
+
+// T4b 原盲点回归:rcd 持续不可达 + 轮询冻结(worker 全卡在 rcd 同步 HTTP → slot 不释放 →
+// receiveLoop 停推 progress)。旧实现无条件续命 → 永判健康;新实现必须累计 stall,达 maxStall 停报。
+func TestEvalTick_ProbeFailurePollFrozenWithholdsAfterMaxStall(t *testing.T) {
+	h := &healthState{maxStall: testMaxStall, lastPoll: 100, lastActivity: 500, haveActivity: true}
+	// 前 maxStall-1 轮:探测失败 + 轮询冻结,仍续命(吸收短暂抖动)。
+	for i := 0; i < testMaxStall-1; i++ {
+		if !h.evalTick(100 /*poll 冻结*/, 0, false /*rcd 不可达*/) {
+			t.Fatalf("第 %d 轮:未到 maxStall 不应停报", i)
+		}
+	}
+	// 第 maxStall 轮:两信号持续冻结,必须停报让 systemd 重启。
+	if h.evalTick(100, 0, false) {
+		t.Fatal("rcd 持续不可达 + 轮询冻结达 maxStall 必须停报(原盲点回归)")
 	}
 }
 
