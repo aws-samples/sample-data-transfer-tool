@@ -73,11 +73,22 @@ func (c *Clients) InstancesDetailed(ctx context.Context, asg string) ([]Instance
 	return infos, nil
 }
 
-// rcloneProcScript counts running rclone copyto/copy processes.
-const rcloneProcScript = `printf "rclone_procs=%s\n" "$(pgrep -c "[r]clone (copyto|copy)" || echo 0)"`
+// rcloneProcScript counts running rclone transfer processes (Python 版每传输 fork 一个
+// `rclone copyto|deletefile`)。
+//
+// 两个必须点(此前 count 脚本的 bug 根因):
+//  1. **-f**:pgrep 默认只匹配进程名(comm=`rclone`,不含子命令/空格),不加 -f 时
+//     `rclone (copyto|...)` 这种带空格的模式永远匹配不到 comm → 计数恒为 0。旧 count 脚本
+//     缺 -f(而 detail 脚本用了 -af 有 -f),这是两者行为不一致、count 恒 0 的真因。
+//  2. **[r]clone 技巧**:加 -f 后 pgrep 扫**所有**进程的完整命令行,会匹配到执行本脚本的
+//     shell 自身(其 cmdline 含字面串 "rclone (copyto|...)")→ 多计 1。用 `[r]clone` 作正则
+//     只匹配真实进程的 `rclone`,而脚本自身 cmdline 里的字面 `[r]clone` 不匹配正则 → 排除自己。
+//
+// 子命令覆盖 copyto/copy/deletefile(op=DELETE 起的是 rclone deletefile)。
+const rcloneProcScript = `printf "rclone_procs=%s\n" "$(pgrep -cf '[r]clone (copyto|copy|deletefile)' || echo 0)"`
 
-// rcloneDetailScript lists full rclone command lines.
-const rcloneDetailScript = `pgrep -af "[r]clone (copyto|copy)" || echo "(no rclone running)"`
+// rcloneDetailScript lists full rclone command lines (-f 匹配命令行,[r] 排除自身)。
+const rcloneDetailScript = `pgrep -af '[r]clone (copyto|copy|deletefile)' || echo "(no rclone running)"`
 
 // RunRclonePS sends the process-count (detail=false) or command-line
 // (detail=true) probe to all instances of an ASG, paging in ≤50 batches,
