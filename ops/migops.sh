@@ -9,10 +9,9 @@
 # 依赖：aws cli v2、python3 + 仓库代码（/opt/migration）。区域默认 eu-south-2，可用 AWS_REGION 覆盖。
 #
 # 用法：bash ops/migops.sh <命令> <栈名> [参数...]
-#   migops status      <栈>                # 总览：吞吐/队列/DLQ/实例/CPU内存/四态/429（= 整个 dashboard 一屏）
+#   migops status      <栈>                # 总览：吞吐/队列/DLQ/实例/CPU内存/限速（= 整个 dashboard 一屏）
 #   migops throughput  <栈>                # 实时吞吐 Gbps（NetworkIn=源下载 / NetworkOut=S3上传）
 #   migops queue       <栈>                # 队列积压 / in-flight / DLQ 深度
-#   migops states      <栈>                # 四态 attempts/min（SUCCESS/RETRYABLE/FATAL/UNKNOWN）+ 429 信号
 #   migops workers     <栈>                # 活跃 worker 数 + ASG 实例列表
 #   migops inspect     <栈> <source>       # 单个对象的传输尝试历史（查状态表）
 #   migops ratelimit   <栈>                # 查当前限速（带宽 + 频率 + 开关）
@@ -107,44 +106,6 @@ cmd_queue() {  # <stack>
     printf "  ${C_ERR}DLQ 死信      %s（有失败消息，可 migops dlq-replay 重投）${C_0}\n" "$dlq"
   else
     printf "  DLQ 死信      %s\n" "${dlq:-0}"
-  fi
-}
-
-cmd_states() {  # <stack>
-  hdr "四态 attempts/min（最近窗口，按 State）"
-  local now start
-  now=$(date -u +%s); start=$((now - 300))
-  # EMF AttemptCount 按 State 维度。SEARCH 不便用 cli，逐态查（FATAL 没数据=0，正好补上 dashboard 缺的第4态）
-  for st in SUCCESS RETRYABLE FATAL UNKNOWN; do
-    local v
-    v=$(aws cloudwatch get-metric-statistics --region "$REGION" \
-      --namespace GcsS3Migration --metric-name AttemptCount \
-      --dimensions "Name=State,Value=$st" \
-      --start-time "$(date -u -d "@$start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$start" +%Y-%m-%dT%H:%M:%SZ)" \
-      --end-time "$(date -u -d "@$now" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$now" +%Y-%m-%dT%H:%M:%SZ)" \
-      --period 60 --statistics Sum \
-      --query "sort_by(Datapoints,&Timestamp)[-1].Sum" --output text 2>/dev/null)
-    [ "$v" = "None" ] || [ -z "$v" ] && v=0
-    local color="$C_0"
-    [ "$st" = "RETRYABLE" ] && [ "${v%.*}" -gt 0 ] 2>/dev/null && color="$C_WARN"
-    [ "$st" = "FATAL" ] && [ "${v%.*}" -gt 0 ] 2>/dev/null && color="$C_ERR"
-    printf "  ${color}%-10s %s${C_0}\n" "$st" "$v"
-  done
-  echo "  ${C_DIM}（FATAL 长期为 0 是健康信号——无不可重试的致命失败）${C_0}"
-  hdr "源端限流信号：RETRYABLE by ErrorClass（src_rate_limit = 源端 429）"
-  local r
-  r=$(aws cloudwatch get-metric-statistics --region "$REGION" \
-    --namespace GcsS3Migration --metric-name AttemptCount \
-    --dimensions Name=State,Value=RETRYABLE Name=ErrorClass,Value=src_rate_limit \
-    --start-time "$(date -u -d "@$start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$start" +%Y-%m-%dT%H:%M:%SZ)" \
-    --end-time "$(date -u -d "@$now" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$now" +%Y-%m-%dT%H:%M:%SZ)" \
-    --period 60 --statistics Sum \
-    --query "sort_by(Datapoints,&Timestamp)[-1].Sum" --output text 2>/dev/null)
-  [ "$r" = "None" ] || [ -z "$r" ] && r=0
-  if [ "${r%.*}" -gt 0 ] 2>/dev/null; then
-    printf "  ${C_WARN}429/min  %s  ← 源端在限流，建议调低限速（migops set-gbps）${C_0}\n" "$r"
-  else
-    printf "  429/min  %s ${C_DIM}（无源端限流）${C_0}\n" "$r"
   fi
 }
 
@@ -244,7 +205,6 @@ cmd_status() {  # <stack> —— 总览（= 整个 dashboard 一屏）
   hdr "CPU / 内存"; cmd_cpumem "$1"
   hdr "队列";       cmd_queue "$1"
   hdr "Worker";     cmd_workers "$1"
-  cmd_states "$1"
   hdr "限速";       cmd_ratelimit "$1"
 }
 
@@ -272,7 +232,6 @@ case "$CMD" in
   status)      cmd_status     "$STACK" ;;
   throughput)  hdr "吞吐"; cmd_throughput "$STACK" ;;
   queue)       hdr "队列"; cmd_queue "$STACK" ;;
-  states)      cmd_states     "$STACK" ;;
   workers)     hdr "Worker"; cmd_workers "$STACK" ;;
   cpumem)      hdr "CPU/内存"; cmd_cpumem "$STACK" ;;
   inspect)     [ $# -lt 1 ] && die "用法: migops inspect <栈> <source>"; cmd_inspect "$STACK" "$1" ;;

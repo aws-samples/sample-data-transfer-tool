@@ -106,11 +106,14 @@ Parameters:
       e.g. migration-dest-
   RatelimitBwlimit:
     Type: String
-    Default: 'off'
+    Default: '1250M'
     Description: >-
-      Per-host rcd global bandwidth cap, rclone --bwlimit format (e.g. 745M = 745 MiB/s), or 'off'.
-      Read ONCE at go-worker startup and applied to the local rcd daemon; no AIMD, no periodic reread.
-      Change value + roll instances to take effect. e.g. 745M
+      Per-host rcd global bandwidth cap, rclone --bwlimit format (e.g. 1250M = 1250 MiB/s), or 'off'.
+      Default 1250M ≈ 10 Gigabit/s per host — a CONSERVATIVE fraction of the c8in.8xlarge 50Gbps NIC.
+      The real constraint is aggregate load on the GCS source: at 449 hosts this is already ~4.5Tbps
+      egress; raising per-host bw multiplies source-side QPS/429 risk. Tune UP only after load-testing
+      the source's total capacity (watch NetworkIn + 429). Read ONCE at go-worker startup and applied
+      to the local rcd daemon; no AIMD, no periodic reread. Change value + roll instances to take effect.
   RatelimitTpslimit:
     Type: String
     Default: 'off'
@@ -247,19 +250,7 @@ Resources:
         - { Key: ManagedBy, Value: cloudformation }
 
   # ─────────────────────────── Log groups (this stack's own) ───────────────────────────
-  # WorkerLogGroup = pure EMF JSON (metrics auto-extracted). WorkerOpsLogGroup = ops logs (DIAG lines etc).
-  # MUST stay separate: mixing ops logs into the EMF group would break metric extraction.
-  WorkerLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/migration/${AWS::StackName}/worker'
-      RetentionInDays: 7
-      Tags:
-        - { Key: Project, Value: !Ref ProjectTag }
-        - { Key: Stack, Value: !Ref 'AWS::StackName' }
-        - { Key: Component, Value: monitoring }
-        - { Key: ManagedBy, Value: cloudformation }
-
+  # WorkerOpsLogGroup = 分级运维日志（四态/失败计数/DIAG）。EMF 指标路径已删除，无独立指标日志组。
   WorkerOpsLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -343,8 +334,6 @@ Resources:
                   - logs:DescribeLogStreams
                   - logs:PutRetentionPolicy
                 Resource:
-                  - !GetAtt WorkerLogGroup.Arn
-                  - !Sub '${WorkerLogGroup.Arn}:*'
                   - !GetAtt WorkerOpsLogGroup.Arn
                   - !Sub '${WorkerOpsLogGroup.Arn}:*'
               - Effect: Allow
@@ -562,8 +551,8 @@ Resources:
 
                   # ② go-worker：单进程多 goroutine（WORKER_GOROUTINES 必须等于 rcd --transfers）。
                   # 依赖 rcd，启动时探 rc/noop 就绪才消费。
-                  # 日志双流：EMF→stdout→worker-emf log（CW 抽取指标）；分级运维日志（WARNING+）
-                  # → OPS_LOG_PATH=worker-ops-0.log（CW 采集 worker-ops 组，失败/poison 不登机可查）。
+                  # 日志：分级运维日志（WARNING+，含四态/失败计数）→ OPS_LOG_PATH=worker-ops-0.log
+                  # （CW 采集 worker-ops 组，失败/poison 不登机可查）。无 EMF 指标路径。
                   # watchdog：Type=notify + WatchdogSec=120 —— go-worker 周期 sd_notify(WATCHDOG=1)，
                   # 僵死（轮询与 rcd 传输字节连续多轮均不推进）则停报 → systemd 120s 超时重启。
                   # WatchdogSignal=SIGTERM：watchdog 超时走与正常停机相同的 SIGTERM 路径（默认 SIGABRT
@@ -596,7 +585,7 @@ Resources:
                   Environment="AWS_METADATA_SERVICE_NUM_ATTEMPTS=5"
                   Environment="AWS_METADATA_SERVICE_TIMEOUT=10"
                   ExecStart=/usr/local/bin/go-worker
-                  StandardOutput=append:/var/log/migration/worker-emf-0.log
+                  StandardOutput=journal
                   StandardError=journal
                   Restart=always
                   RestartSec=10
@@ -633,12 +622,6 @@ Resources:
                     "logs_collected": {
                       "files": {
                         "collect_list": [
-                          {
-                            "file_path": "/var/log/migration/worker-emf-*.log",
-                            "log_group_name": "${WorkerLogGroup}",
-                            "log_stream_name": "{instance_id}",
-                            "retention_in_days": 7
-                          },
                           {
                             "file_path": "/var/log/migration/worker-ops-*.log",
                             "log_group_name": "${WorkerOpsLogGroup}",
@@ -843,9 +826,6 @@ Outputs:
     Value: !Join [',', !Ref WorkerSubnetIds]
   TransferStatusTable: { Value: !Ref TransferStatusTable }
   HeartbeatTable: { Value: !Ref HeartbeatTable }
-  WorkerLogGroup:
-    Description: Shared EMF metrics log group (CloudWatch auto-extracts the GcsS3Migration namespace).
-    Value: !Ref WorkerLogGroup
 
   # ── this cluster ──
   QueueUrl: { Value: !Ref MigrationQueue }

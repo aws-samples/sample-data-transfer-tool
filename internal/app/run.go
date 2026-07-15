@@ -10,7 +10,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 
-	"github.com/aws-samples/sample-data-transfer-tool/internal/emf"
 	"github.com/aws-samples/sample-data-transfer-tool/internal/obslog"
 	"github.com/aws-samples/sample-data-transfer-tool/internal/ratelimit"
 	"github.com/aws-samples/sample-data-transfer-tool/internal/rcd"
@@ -64,20 +63,13 @@ func Run(ctx context.Context, cfg Config) error {
 	go heartbeatLoop(ctx, store, cfg.InstanceID, cfg.Workers)
 	go progressLoop(ctx, stats)
 
-	// EMF 指标默认关（MetricsEnabled=false）——不打 EMF,省 CloudWatch 摄入+指标费,对齐 Python。
-	// 需观测时设 METRICS_ENABLED=true 打开。四态计数/DDB 终态/ops 日志不受影响。
-	report := func(ev worker.EMFEvent) {}
-	if cfg.MetricsEnabled {
-		report = func(ev worker.EMFEvent) {
-			_ = emf.Emit(ev, func(s string) { fmt.Println(s) })
-		}
-	}
-
+	// 无 EMF 指标路径：四态/失败计数经 progressLoop + 停机日志打到 worker-ops,DDB 存终态,
+	// 省 CloudWatch 摄入+指标费。观测靠 ops 日志 + DDB,不再有 stdout EMF。
 	consumer := worker.NewConsumer(sqsClient, worker.ConsumerConfig{
 		QueueURL:  cfg.QueueURL,
 		Receivers: cfg.Receivers,
 		Workers:   cfg.Workers,
-	}, cfg.InstanceID, run.RunCopy, store, report, stats)
+	}, cfg.InstanceID, run.RunCopy, store, stats)
 
 	// systemd watchdog：轮询活性(consumer.Progress) OR 传输活性(rcd 全局字节)推进才上报
 	// WATCHDOG=1;两信号连续多轮全冻结(真僵死/worker 全卡死在 rcd HTTP)才停报让 systemd 重启。

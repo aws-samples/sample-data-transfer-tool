@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,7 +53,6 @@ type Consumer struct {
 	instanceID string
 	runCopy    func(context.Context, message.TransferMessage) model.RunResult
 	store      Recorder
-	report     func(EMFEvent)
 	stats      *Stats
 
 	inflight sync.Map     // receipt -> struct{}，停机时批量重置 visibility=0
@@ -86,7 +84,7 @@ type Recorder interface {
 // 测试可注入 fake）。
 func NewConsumer(sqsClient SQSAPI, cfg ConsumerConfig, instanceID string,
 	runCopy func(context.Context, message.TransferMessage) model.RunResult,
-	store Recorder, report func(EMFEvent), stats *Stats) *Consumer {
+	store Recorder, stats *Stats) *Consumer {
 	if cfg.Receivers <= 0 {
 		cfg.Receivers = 2
 	}
@@ -95,7 +93,7 @@ func NewConsumer(sqsClient SQSAPI, cfg ConsumerConfig, instanceID string,
 	}
 	return &Consumer{
 		sqs: sqsClient, cfg: cfg, instanceID: instanceID,
-		runCopy: runCopy, store: store, report: report, stats: stats,
+		runCopy: runCopy, store: store, stats: stats,
 	}
 }
 
@@ -154,9 +152,8 @@ func (c *Consumer) receiveLoop(ctx context.Context, jobCh chan<- queuedMessage, 
 		c.progress.Add(1)
 		out, err := c.sqs.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:              aws.String(c.cfg.QueueURL),
-			MaxNumberOfMessages:   safeReceiveBatch(taken),
-			WaitTimeSeconds:       20, // long-poll
-			MessageAttributeNames: []string{"object_size"},
+			MaxNumberOfMessages: safeReceiveBatch(taken),
+			WaitTimeSeconds:     20, // long-poll
 		})
 		if err != nil {
 			c.releaseSlots(slots, taken)
@@ -236,7 +233,6 @@ func (c *Consumer) handle(ctx context.Context, qm queuedMessage) {
 	receipt := qm.receipt
 	defer c.finishInflight(receipt)
 
-	size := parseObjectSize(m)
 	attemptTS := nowAttemptTS()
 	body := aws.ToString(m.Body)
 
@@ -249,9 +245,8 @@ func (c *Consumer) handle(ctx context.Context, qm queuedMessage) {
 			// 两者分开，DDB 里能看到开始时间 + 完成时间 + 中间的 elapsed。
 			return c.store.RecordTerminal(ctx, source, ts, result, c.instanceID, nowAttemptTS(), b)
 		},
-		Report: c.report,
 	}
-	out := ProcessMessage(ctx, body, size, c.instanceID, attemptTS, eff)
+	out := ProcessMessage(ctx, body, c.instanceID, attemptTS, eff)
 	c.tally(out)
 }
 
@@ -318,19 +313,6 @@ func (c *Consumer) resetOneVisibility(receipt string) {
 		c.stats.RequeueFail.Add(1)
 		obslog.Errorf("取消投递前重置 visibility 失败 receipt=%s err=%v", receipt, err)
 	}
-}
-
-// parseObjectSize 从 SQS MessageAttribute object_size 读对象大小（缺省 0=small 维度）。
-func parseObjectSize(m sqstypes.Message) int64 {
-	attr, ok := m.MessageAttributes["object_size"]
-	if !ok || attr.StringValue == nil {
-		return 0
-	}
-	n, err := strconv.ParseInt(*attr.StringValue, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return n
 }
 
 func (c *Consumer) tally(o Outcome) {

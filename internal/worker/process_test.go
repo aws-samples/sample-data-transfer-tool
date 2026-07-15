@@ -17,12 +17,8 @@ type recorder struct {
 	recordedBody   string
 	recordedSrc    string
 	recordedResult model.RunResult
-	reported           bool
-	reportState        string
-	reportEvent        EMFEvent
-	recordFailReported bool // 上报过 record_fail 事件（不被后续 reportResult 覆盖）
-	recordErr          error
-	deleteErr          error
+	recordErr      error
+	deleteErr      error
 }
 
 func (r *recorder) effects(result model.RunResult) Effects {
@@ -36,44 +32,35 @@ func (r *recorder) effects(result model.RunResult) Effects {
 			r.recordedBody = body
 			return r.recordErr
 		},
-		Report: func(ev EMFEvent) {
-			r.reported = true
-			r.reportState = ev.State
-			r.reportEvent = ev
-			if ev.ErrorClass == "record_fail" {
-				r.recordFailReported = true
-			}
-		},
 	}
 }
 
 const okBody = `{"source":"s3:b/k","destination":"s3:b/k2"}`
 
 // SUCCESS 记录的传输信息（bytes/elapsed/speed）由 runner 从 rcd group stats 填好，
-// process 原样透传到 DDB + EMF（不再用 object_size 推断）。
+// process 原样透传到 DDB（无 EMF 路径后，DDB 终态是唯一落点）。
 func TestSuccessStatsPassThrough(t *testing.T) {
 	r := &recorder{}
 	// runner 返回的 RunResult 已带 rcd 真实 stats
 	res := model.RunResult{State: model.StateSuccess, Stats: model.TransferStats{
 		Bytes: 12345, ElapsedSeconds: 0.5, Speed: 24690,
 	}}
-	// object_size 传 0（模拟消息体没有 object_size 的真实情况）
-	out := ProcessMessage(context.Background(), okBody, 0, "i#0", "ts", r.effects(res))
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts", r.effects(res))
 	if out.State != model.StateSuccess {
 		t.Fatal(out)
 	}
-	// 即使 object_size=0，bytes 仍来自 rcd 真实结果
+	// bytes 来自 rcd 真实结果，落 DDB 终态
 	if r.recordedResult.Stats.Bytes != 12345 {
-		t.Errorf("transferred_bytes 应=rcd 真实 12345（非 object_size）, got %d", r.recordedResult.Stats.Bytes)
+		t.Errorf("transferred_bytes 应=rcd 真实 12345, got %d", r.recordedResult.Stats.Bytes)
 	}
-	if r.reportEvent.Bytes != 12345 || r.reportEvent.Elapsed != 0.5 {
-		t.Errorf("EMF 应透传 rcd stats, got %+v", r.reportEvent)
+	if r.recordedResult.Stats.ElapsedSeconds != 0.5 {
+		t.Errorf("elapsed 应透传 rcd stats, got %v", r.recordedResult.Stats.ElapsedSeconds)
 	}
 }
 
 func TestSuccessDeletesNotRequeue(t *testing.T) {
 	r := &recorder{}
-	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateSuccess}))
 	if !out.Counted || out.State != model.StateSuccess {
 		t.Fatalf("outcome=%+v", out)
@@ -91,7 +78,7 @@ func TestSuccessDeletesNotRequeue(t *testing.T) {
 
 func TestRetryableRequeuesWithBackoff(t *testing.T) {
 	r := &recorder{}
-	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateRetryable, ErrorClass: "src_rate_limit"}))
 	if !out.Counted || out.State != model.StateRetryable {
 		t.Fatalf("outcome=%+v", out)
@@ -109,7 +96,7 @@ func TestRetryableRequeuesWithBackoff(t *testing.T) {
 
 func TestFatalRequeuesZeroCounted(t *testing.T) {
 	r := &recorder{}
-	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateFatal, ErrorClass: "src_not_found"}))
 	if !out.Counted || out.State != model.StateFatal {
 		t.Fatalf("outcome=%+v", out)
@@ -124,7 +111,7 @@ func TestFatalRequeuesZeroCounted(t *testing.T) {
 
 func TestUnknownNotCounted(t *testing.T) {
 	r := &recorder{}
-	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateUnknown}))
 	if out.Counted {
 		t.Error("UNKNOWN 不计数")
@@ -137,7 +124,7 @@ func TestUnknownNotCounted(t *testing.T) {
 func TestPoisonMessageNotDeletedNotCounted(t *testing.T) {
 	r := &recorder{}
 	// 缺 destination → 解析失败 → poison
-	out := ProcessMessage(context.Background(), `{"source":"s3:b/orphan"}`, 0, "i#0", "ts",
+	out := ProcessMessage(context.Background(), `{"source":"s3:b/orphan"}`, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateSuccess})) // RunCopy 不该被调用
 	if out.Counted {
 		t.Error("poison 不计数")
@@ -164,31 +151,21 @@ func TestPoisonMessageNotDeletedNotCounted(t *testing.T) {
 func TestDeleteRecordKeyUsesDestination(t *testing.T) {
 	r := &recorder{}
 	delBody := `{"destination":"s3:b/victim.bin","op":"delete"}`
-	ProcessMessage(context.Background(), delBody, 0, "i#0", "ts",
+	ProcessMessage(context.Background(), delBody, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateSuccess}))
 	if r.recordedSrc != "s3:b/victim.bin" {
 		t.Errorf("delete DDB key 应用 destination，got %q", r.recordedSrc)
 	}
 }
 
-func TestQueueTypeDimension(t *testing.T) {
-	r := &recorder{}
-	ProcessMessage(context.Background(), okBody, 200*1024*1024, "i#0", "ts",
-		r.effects(model.RunResult{State: model.StateSuccess}))
-	if !r.reported {
-		t.Fatal("应上报 EMF")
-	}
-	// 200MB ≥ 100MB 阈值 → large（仅维度，非路由）
-}
-
 // G1 best-effort（对齐 Python worker，907K inflight 事故根治）：DDB record 是旁路，
 // 失败绝不能阻断 SQS 生命周期动作。record 失败时四态该干嘛还干嘛（SUCCESS 照删、
-// 失败态照 requeue），只记 record_fail(供观测)+ 保持原四态结果。
+// 失败态照 requeue），只标记 RecordFailed（→ Stats.RecordFail 计数 + 进度日志暴露）+ 保持原四态结果。
 // 根因：DDB 持续节流时若因 record 失败改判 UNKNOWN/Requeue(60)，SUCCESS 消息会无限
 // 重投堆积 inflight（Python 旧实现正是此坑，堆到 907K）。
 func TestRecordFailureSuccessStillDeletes(t *testing.T) {
 	r := &recorder{recordErr: errors.New("ddb throttled")}
-	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateSuccess}))
 	if out.State != model.StateSuccess || !out.Counted {
 		t.Fatalf("record 失败不应改变 SUCCESS 四态结果，outcome=%+v", out)
@@ -200,16 +177,13 @@ func TestRecordFailureSuccessStillDeletes(t *testing.T) {
 		t.Error("SUCCESS 不应 requeue")
 	}
 	if !out.RecordFailed {
-		t.Error("应标记 RecordFailed 供观测")
-	}
-	if !r.recordFailReported {
-		t.Error("应上报 record_fail EMF 观测事件")
+		t.Error("应标记 RecordFailed 供观测（→ Stats.RecordFail 计数）")
 	}
 }
 
 func TestRecordFailureFatalStillRequeues(t *testing.T) {
 	r := &recorder{recordErr: errors.New("ddb throttled")}
-	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateFatal, ErrorClass: "src_not_found"}))
 	if out.State != model.StateFatal || !out.Counted {
 		t.Fatalf("record 失败不应改变 FATAL 四态结果，outcome=%+v", out)
@@ -224,7 +198,7 @@ func TestRecordFailureFatalStillRequeues(t *testing.T) {
 
 func TestRecordFailureRetryableStillRequeuesWithBackoff(t *testing.T) {
 	r := &recorder{recordErr: errors.New("ddb throttled")}
-	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateRetryable, ErrorClass: "src_rate_limit"}))
 	if out.State != model.StateRetryable || !out.Counted {
 		t.Fatalf("record 失败不应改变 RETRYABLE 四态结果，outcome=%+v", out)
@@ -234,9 +208,11 @@ func TestRecordFailureRetryableStillRequeuesWithBackoff(t *testing.T) {
 	}
 }
 
-func TestDeleteFailureReportsUnknownNotSuccess(t *testing.T) {
+// delete 失败：不能上报 SUCCESS（否则 FileCount 虚高），判 UNKNOWN 不计数，
+// 等 visibility 超时重投（不显式 requeue）。delete_fail 计数在 consumer.deleteMsg 独立 +1。
+func TestDeleteFailureYieldsUnknownNotSuccess(t *testing.T) {
 	r := &recorder{deleteErr: errors.New("sqs delete failed")}
-	out := ProcessMessage(context.Background(), okBody, 10, "i#0", "ts",
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
 		r.effects(model.RunResult{State: model.StateSuccess}))
 	if out.Counted || out.State != model.StateUnknown {
 		t.Fatalf("delete failure outcome=%+v", out)
@@ -246,8 +222,5 @@ func TestDeleteFailureReportsUnknownNotSuccess(t *testing.T) {
 	}
 	if r.requeued {
 		t.Error("delete failure 不应显式 requeue，等待 visibility 超时重投")
-	}
-	if r.reportEvent.State != string(model.StateUnknown) || r.reportEvent.ErrorClass != "delete_fail" {
-		t.Errorf("应上报 UNKNOWN/delete_fail，got %+v", r.reportEvent)
 	}
 }

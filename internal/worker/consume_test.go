@@ -74,7 +74,7 @@ func TestConsumer_ReceiveBatchCappedByWorkerSlots(t *testing.T) {
 		return model.RunResult{State: model.StateSuccess}
 	}
 	c := NewConsumer(fs, ConsumerConfig{QueueURL: "q", Receivers: 1, Workers: 2}, "i#0",
-		runCopy, rec, func(EMFEvent) {}, stats)
+		runCopy, rec, stats)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -96,7 +96,7 @@ func TestConsumer_ReceiveBatchCappedByWorkerSlots(t *testing.T) {
 func TestConsumer_SQSSideEffectsIgnoreCanceledParentContext(t *testing.T) {
 	fs := &fakeSQS{}
 	c := NewConsumer(fs, ConsumerConfig{QueueURL: "q", Receivers: 1, Workers: 1}, "i#0",
-		nil, &fakeRecorder{}, func(EMFEvent) {}, &Stats{})
+		nil, &fakeRecorder{}, &Stats{})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -135,7 +135,7 @@ func TestConsumer_SuccessDeletesAll(t *testing.T) {
 	}
 
 	c := NewConsumer(fs, ConsumerConfig{QueueURL: "q", Receivers: 1, Workers: 4}, "i#0",
-		runCopy, rec, func(EMFEvent) {}, stats)
+		runCopy, rec, stats)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -166,7 +166,7 @@ func TestTally_RecordFailStillCountsFourStates(t *testing.T) {
 	newC := func() (*Consumer, *Stats) {
 		st := &Stats{}
 		c := NewConsumer(&fakeSQS{}, ConsumerConfig{QueueURL: "q", Receivers: 1, Workers: 1},
-			"i#0", nil, &fakeRecorder{}, func(EMFEvent) {}, st)
+			"i#0", nil, &fakeRecorder{}, st)
 		return c, st
 	}
 	cases := []struct {
