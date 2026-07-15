@@ -544,10 +544,11 @@ Resources:
                     --config /root/.config/rclone/rclone.conf \\
                     --rc-job-expire-duration 1m \\
                     --transfers ${WorkerThreads} \\
-                    --s3-upload-cutoff 100M --s3-chunk-size 64M --s3-upload-concurrency 8 \\
+                    --s3-upload-cutoff 100M --s3-chunk-size 64M --s3-upload-concurrency 16 \\
                     --buffer-size 32M --max-buffer-memory 2G --use-mmap \\
                     --header-upload "x-amz-checksum-algorithm: CRC32C" \\
                     --header-upload "x-amz-checksum-type: FULL_OBJECT" \\
+                    --header-download "Accept-Encoding: gzip" \\
                     --s3-no-check-bucket --s3-disable-checksum --s3-no-head \\
                     --metadata --s3-encoding Slash,InvalidUtf8 \\
                     --retries 3 --low-level-retries 10 --no-traverse \\
