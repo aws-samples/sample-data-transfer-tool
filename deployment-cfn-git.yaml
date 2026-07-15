@@ -312,7 +312,9 @@ Resources:
                 Resource:
                   - !GetAtt MigrationQueue.Arn
               - Effect: Allow
-                Action: [dynamodb:PutItem, dynamodb:Query, dynamodb:Scan]
+                # PutItem = 心跳（HeartbeatTable）；BatchWriteItem = 终态记录异步批量 writer
+                # （TransferStatusTable，25 条/批）。两者都需要，缺 BatchWriteItem 会 AccessDenied → 丢审计。
+                Action: [dynamodb:PutItem, dynamodb:BatchWriteItem, dynamodb:Query, dynamodb:Scan]
                 Resource:
                   - !GetAtt TransferStatusTable.Arn
                   - !GetAtt HeartbeatTable.Arn
