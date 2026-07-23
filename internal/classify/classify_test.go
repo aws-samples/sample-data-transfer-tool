@@ -18,6 +18,15 @@ func TestClassifyError(t *testing.T) {
 		{"rcd_object_not_found", 1, "object not found", "src_not_found"},
 		{"src_5xx", 1, "GetObject 503 from source", "src_5xx"},
 		{"dst_5xx", 1, "PutObject upload 500 to s3 bucket", "dst_5xx"},
+		// 2026-07-22 GCS h2 僵死连接事故的真实错误串——曾落 uncategorized(退避0→重投风暴)。
+		{"net_h2_stuck", 1, `operation error S3: HeadObject, https response error StatusCode: 0, request send failed, Head "https://x.storage.googleapis.com/a.gz": http2: timeout awaiting response headers`, "net_transient"},
+		{"net_conn_reset", 1, "read: connection reset by peer", "net_transient"},
+		// 同族连接死亡 signature——broken pipe/unexpected EOF 不含 "timeout"，漏则误判 FATAL 进 DLQ。
+		{"net_broken_pipe", 1, "write tcp 10.0.0.1:443: broken pipe", "net_transient"},
+		{"net_unexpected_eof", 1, "read tcp: unexpected EOF", "net_transient"},
+		{"net_ctx_deadline", 1, "context deadline exceeded", "net_transient"},
+		// 根因优先级:同时含 429 与网络文本时,429 是根因(排在网络类之前)。
+		{"rate_limit_over_net", 1, "StatusCode: 429 TooManyRequests; connection reset", "src_rate_limit"},
 		{"integrity", 1, "corrupted on transfer: sizes differ", "integrity_hash"},
 		{"real_oom", 1, "fatal error: out of memory", "worker_oom"},
 		{"sigkill", 1, "process killed by signal 9", "worker_oom"},
@@ -68,6 +77,7 @@ func TestRetryDelaySeconds(t *testing.T) {
 		"src_rate_limit": 300,
 		"src_5xx":        60,
 		"dst_5xx":        60,
+		"net_transient":  30,
 		"src_not_found":  0,
 		"worker_oom":     0,
 		"":               0,

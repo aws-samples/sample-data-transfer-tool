@@ -167,6 +167,34 @@ func TestRunCopy_SourceNotFoundFatalNoStatsDependency(t *testing.T) {
 	}
 }
 
+// 2026-07-22 GCS h2 僵死连接事故语义锁定：rcd copyfile 返回 "http2: timeout awaiting
+// response headers" 应判 RETRYABLE/net_transient（非 uncategorized）→ 30s 退避而非 0s 立即
+// 重投，避免把失败消息反复灌回坏连接、打爆 SDK retry token。
+func TestRunCopy_H2StuckConnectionNetTransient(t *testing.T) {
+	f := newFakeRCDServer(t)
+	f.errBody = `operation error S3: HeadObject, https response error StatusCode: 0, request send failed, ` +
+		`Head "https://x.storage.googleapis.com/a.gz": http2: timeout awaiting response headers`
+	res := f.runner(5 * time.Second).RunCopy(context.Background(), copyMsg)
+	if res.State != model.StateRetryable || res.ErrorClass != "net_transient" {
+		t.Errorf("h2 僵死连接应 RETRYABLE/net_transient，got %s/%s", res.State, res.ErrorClass)
+	}
+}
+
+// 回归(Codex 交叉审出)：delete 遇网络错误 "no such host" 不得被 IsDeleteNoop 的宽泛 "no such"
+// 误判为幂等 SUCCESS——那会删掉消息但删除操作实际没执行(假成功丢数据)。应判 RETRYABLE/net_transient。
+func TestRunCopy_DeleteNetworkErrorNotFalseSuccess(t *testing.T) {
+	f := newFakeRCDServer(t)
+	f.errBody = `Delete "https://x.storage.googleapis.com/a": dial tcp: lookup x: no such host`
+	delMsg := message.TransferMessage{Destination: "s3:b/k", Op: model.OpDelete}
+	res := f.runner(5 * time.Second).RunCopy(context.Background(), delMsg)
+	if res.State == model.StateSuccess {
+		t.Fatalf("delete 遇 'no such host' 网络错误被误判假成功(会丢消息)，got %s/%s", res.State, res.ErrorClass)
+	}
+	if res.State != model.StateRetryable || res.ErrorClass != "net_transient" {
+		t.Errorf("delete 网络错误应 RETRYABLE/net_transient，got %s/%s", res.State, res.ErrorClass)
+	}
+}
+
 func TestRunCopy_DeleteNoopIdempotent(t *testing.T) {
 	f := newFakeRCDServer(t)
 	f.errBody = "object not found" // 删不存在的对象

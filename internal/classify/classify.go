@@ -28,6 +28,11 @@ var errorPatterns = []struct {
 	{regexp.MustCompile(`(?i)\b404\b|not\s*found|does not exist|doesn'?t exist`), "src_not_found"},
 	// 5xx（resolver 再按源/目标分流）
 	{regexp.MustCompile(`(?i)\b5\d\d\b`), ""},
+	// 网络/连接层瞬时失败（http2 僵死连接、连接重置、请求发送失败、DNS/TLS 握手超时）。
+	// 独立成类而非落 uncategorized：uncategorized 退避=0 → 零延迟立即重投，把失败中的消息
+	// 反复灌回同一批坏连接，打爆 AWS SDK retry token（2026-07-22 GCS h2 僵死连接事故实证：
+	// RETRYABLE 风暴 + "retry quota exceeded"）。排在 429/5xx 之后：带 5xx/429 的错误按其根因归类。
+	{regexp.MustCompile(`(?i)awaiting response headers|request send failed|connection reset|connection refused|broken pipe|unexpected eof|no such host|network is unreachable|i/o timeout|tls handshake timeout|deadline exceeded|dial tcp`), "net_transient"},
 	// 真正的 OOM / 被强杀（SIGKILL/信号9/out of memory）——排除优雅 "signal received: terminated"
 	{regexp.MustCompile(`(?i)\bout of memory\b|\boom-?kill`), "worker_oom"},
 	{regexp.MustCompile(`(?i)\bsigkill\b|\bkilled\b|signal 9\b`), "worker_oom"},
@@ -55,6 +60,7 @@ var retryDelayByClass = map[string]int{
 	"src_rate_limit": 300,
 	"src_5xx":        60,
 	"dst_5xx":        60,
+	"net_transient":  30,
 }
 
 // RetryDelaySeconds 按 error_class 返回重投 VisibilityTimeout 秒数。

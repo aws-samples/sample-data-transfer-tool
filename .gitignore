@@ -59,3 +59,4 @@ OPS.html
 cluster-ops.html
 ops/rclone-watch.sh
 ops/watch-3pools.sh
+dist/

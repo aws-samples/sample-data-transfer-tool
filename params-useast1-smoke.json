@@ -1,0 +1,22 @@
+[
+  { "ParameterKey": "VpcId", "ParameterValue": "vpc-040b6dd72b705cefe" },
+  { "ParameterKey": "WorkerSubnetIds", "ParameterValue": "subnet-078828537561d75b0,subnet-0129b7a68b535701e" },
+  { "ParameterKey": "EipPoolTagKey", "ParameterValue": "" },
+  { "ParameterKey": "EipPoolTagValue", "ParameterValue": "" },
+  { "ParameterKey": "GcsHmacSecretArn", "ParameterValue": "arn:aws:secretsmanager:us-east-1:918380168589:secret:migration-gcs-hmac-smoke-9VHrD9" },
+  { "ParameterKey": "ArtifactsBucket", "ParameterValue": "datatos3-code" },
+  { "ParameterKey": "TargetBucketPrefix", "ParameterValue": "migration-smoke-dest-" },
+  { "ParameterKey": "RatelimitBwlimit", "ParameterValue": "1250M" },
+  { "ParameterKey": "RatelimitTpslimit", "ParameterValue": "off" },
+  { "ParameterKey": "InstanceType", "ParameterValue": "c7g.xlarge" },
+  { "ParameterKey": "CpuArch", "ParameterValue": "arm64" },
+  { "ParameterKey": "InstanceCount", "ParameterValue": "1" },
+  { "ParameterKey": "WorkerCount", "ParameterValue": "2" },
+  { "ParameterKey": "WorkerThreads", "ParameterValue": "4" },
+  { "ParameterKey": "RootVolumeSize", "ParameterValue": "30" },
+  { "ParameterKey": "GitRepoUrl", "ParameterValue": "https://github.com/aws-samples/sample-data-transfer-tool" },
+  { "ParameterKey": "GoWorkerReleaseTag", "ParameterValue": "go-worker-v0.5.3" },
+  { "ParameterKey": "RcloneS3Key", "ParameterValue": "ops/rclone-v1.74.3-arm64" },
+  { "ParameterKey": "KeyPairName", "ParameterValue": "linnjia-us-east-1" },
+  { "ParameterKey": "ProjectTag", "ParameterValue": "gcs-s3-migration-smoke" }
+]

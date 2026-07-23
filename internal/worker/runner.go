@@ -140,12 +140,15 @@ func (r *Runner) RunCopy(ctx context.Context, msg message.TransferMessage) model
 		}
 	}
 
-	// rcd 业务错误：delete 幂等（目标已不存在）→ SUCCESS。
-	if msg.Op == model.OpDelete && classify.IsDeleteNoop(errText) {
+	// 先分类：delete 的幂等判定要排除网络类错误。
+	errClass := classify.ClassifyError(1, errText)
+	// rcd 业务错误：delete 幂等（目标确已不存在）→ SUCCESS。但网络类错误（如 DNS "no such host"
+	// 命中 IsDeleteNoop 的宽泛 "no such"）下删除是否已执行未知，绝不能走假成功捷径删消息（丢数据），
+	// 必须重试。errClass==net_transient 时跳过幂等短路，落到下方 RETRYABLE。
+	if msg.Op == model.OpDelete && errClass != "net_transient" && classify.IsDeleteNoop(errText) {
 		return model.RunResult{State: model.StateSuccess, ExitCode: 0, CmdStr: cmdStr}
 	}
 	// 其余按错误文本分类四态。
-	errClass := classify.ClassifyError(1, errText)
 	state := decideFailState(errText, errClass)
 	return model.RunResult{
 		State: state, ExitCode: 1,
@@ -182,7 +185,7 @@ func decideFailState(errText, errClass string) model.State {
 		return model.StateFatal
 	}
 	switch errClass {
-	case "src_rate_limit", "src_5xx", "dst_5xx":
+	case "src_rate_limit", "src_5xx", "dst_5xx", "net_transient":
 		return model.StateRetryable
 	}
 	if classify.IsTransientError(errText) {

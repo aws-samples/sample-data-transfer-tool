@@ -478,6 +478,13 @@ Resources:
                 access_key_id = $GCS_AK
                 secret_access_key = $GCS_SK
                 endpoint = https://storage.googleapis.com
+                # disable_http2：GCS 侧禁用 HTTP/2，回退 HTTP/1.1。根治 2026-07-22 事故：网络静默
+                # 断连（无 RST，TCP 半开）致 Go net/http2 客户端把僵死连接判"健康"且优先复用（默认无
+                # PING 探测），--transfers 高并发全复用在坏连接上，请求全卡 "http2: timeout awaiting
+                # response headers"、整机吞吐归零且不自愈。HTTP/1.1 下坏连接只影响自身请求并被连接池
+                # 淘汰。仅源端 GCS：S3 上传走 AWS SDK 独立客户端不受影响。本工具靠高并发连接而非单连接
+                # 多路复用出吞吐，禁 h2 无实质性能损失。
+                disable_http2 = true
 
                 [s3]
                 type = s3
@@ -517,6 +524,11 @@ Resources:
                   Description=rclone rcd daemon (shared transfer engine)
                   After=network-online.target
                   Wants=network-online.target
+                  # Upholds：rcd 一旦(重)启就确保 go-worker 也在跑。与 go-worker 的 BindsTo 配对，
+                  # 覆盖 rcd 崩溃/OOM 被 Restart=always 复活的场景——此时 BindsTo 已停 go-worker，
+                  # 靠这里把它拉回，使其重跑 ApplyOnce 重新注入限速(限速仅 go-worker 启动时设一次，
+                  # rcd 重启后内存里的 bwlimit/tpslimit 归零，不重启 go-worker 就裸奔无 cap)。
+                  Upholds=go-worker.service
                   [Service]
                   Type=simple
                   User=root
@@ -563,7 +575,10 @@ Resources:
                   [Unit]
                   Description=go-worker (rcd-based SQS migration consumer)
                   After=rclone-rcd.service network-online.target
-                  Requires=rclone-rcd.service
+                  # BindsTo(替代 Requires)：rcd 停/崩/被单独重启 → go-worker 一并停；配 rcd 侧
+                  # Upholds=go-worker 把它拉回重跑 ApplyOnce 重新注入限速。根治"rcd 重启后 go-worker
+                  # 不知情、继续用无限速的 rcd 裸奔打爆源端"缺口(限速只在 go-worker 启动时设一次)。
+                  BindsTo=rclone-rcd.service
                   [Service]
                   Type=notify
                   WatchdogSec=120
