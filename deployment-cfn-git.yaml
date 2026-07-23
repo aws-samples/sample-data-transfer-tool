@@ -478,6 +478,13 @@ Resources:
                 access_key_id = $GCS_AK
                 secret_access_key = $GCS_SK
                 endpoint = https://storage.googleapis.com
+                # disable_http2：GCS 侧禁用 HTTP/2，回退 HTTP/1.1。根治 2026-07-22 事故：网络静默
+                # 断连（无 RST，TCP 半开）致 Go net/http2 客户端把僵死连接判"健康"且优先复用（默认无
+                # PING 探测），--transfers 高并发全复用在坏连接上，请求全卡 "http2: timeout awaiting
+                # response headers"、整机吞吐归零且不自愈。HTTP/1.1 下坏连接只影响自身请求并被连接池
+                # 淘汰。仅源端 GCS：S3 上传走 AWS SDK 独立客户端不受影响。本工具靠高并发连接而非单连接
+                # 多路复用出吞吐，禁 h2 无实质性能损失。
+                disable_http2 = true
 
                 [s3]
                 type = s3
