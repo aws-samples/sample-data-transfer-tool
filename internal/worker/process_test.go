@@ -121,6 +121,24 @@ func TestUnknownNotCounted(t *testing.T) {
 	}
 }
 
+// watchdog 杀 worker（SIGTERM→worker_shutdown）时在途消息必须带退避重投：0 秒重投会让
+// 重启后的 worker 立刻重新咬住同批消息，若卡死源在 rcd 侧未清除即成"重启-再卡死"死循环
+// （2026-07-23 缓冲池死锁事故实证）。
+func TestWorkerShutdownRequeuesWithBackoff(t *testing.T) {
+	r := &recorder{}
+	out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
+		r.effects(model.RunResult{State: model.StateUnknown, ErrorClass: "worker_shutdown"}))
+	if out.Counted {
+		t.Error("worker_shutdown 不计数")
+	}
+	if r.deleted {
+		t.Error("worker_shutdown 不删消息")
+	}
+	if !r.requeued || r.requeueDelay != 60 {
+		t.Errorf("worker_shutdown 应 requeue(60)，got requeued=%v delay=%d", r.requeued, r.requeueDelay)
+	}
+}
+
 func TestPoisonMessageNotDeletedNotCounted(t *testing.T) {
 	r := &recorder{}
 	// 缺 destination → 解析失败 → poison

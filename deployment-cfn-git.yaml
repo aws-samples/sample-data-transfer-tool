@@ -512,6 +512,21 @@ Resources:
                   printf 'GOMEMLIMIT=%sKiB\n' "$RCD_MEM_KIB" > /etc/rclone-rcd-mem.env
                   chmod 644 /etc/rclone-rcd-mem.env
 
+                  # 传输缓冲池守恒式：--transfers × --buffer-size 必须 ≤ --max-buffer-memory。
+                  # 违背时 AsyncReader 按 1MiB 块逐块申请缓冲，各传输攥着部分块等下一块，池耗尽即
+                  # 集体资源死锁：goroutine 永久挂 pool semaphore（不吃任何 timeout）、Recv-Q 堆满
+                  # 无人读、整机吞吐归零且不自愈（2026-07-23 事故实证：256×32M=8G 需求撞 2G 池顶，
+                  # 起跑 30s 即冻结）。按 1.5×需求配，封顶机器内存 20%（居 GOMEMLIMIT 85% 之内）；
+                  # 封顶后仍不够需求则拒绝启动（fail-fast：宁可不跑，不可跑死）。
+                  BUF_NEED_MIB=$(( ${WorkerThreads} * 32 ))
+                  BUF_MEM_MIB=$(( BUF_NEED_MIB * 3 / 2 ))
+                  MEM_CAP_MIB=$(awk '/MemTotal/{print int($2/1024*0.20)}' /proc/meminfo)
+                  [ "$BUF_MEM_MIB" -gt "$MEM_CAP_MIB" ] && BUF_MEM_MIB=$MEM_CAP_MIB
+                  if [ "$BUF_MEM_MIB" -lt "$BUF_NEED_MIB" ]; then
+                    echo "缓冲池守恒式违背: max-buffer-memory($BUF_MEM_MIB M) < transfers×buffer-size($BUF_NEED_MIB M)，必死锁，拒绝启动（降 WorkerThreads 或换大内存机型）" >&2
+                    exit 1
+                  fi
+
                   # ① rclone rcd 守护进程：所有传输走 operations/copyfile，连接池复用（消灭每文件 fork+握手）。
                   # 全套 rclone flag 在此一次给全；限速由 go-worker 调 rcd 全局端点生效。
                   # 口令经 EnvironmentFile 注入，ExecStart 用 ${!RCD_PASS}（systemd 运行时展开）。
@@ -548,13 +563,14 @@ Resources:
                     --rc-job-expire-duration 1m \\
                     --transfers ${WorkerThreads} \\
                     --s3-upload-cutoff 100M --s3-chunk-size 64M --s3-upload-concurrency 8 \\
-                    --buffer-size 32M --max-buffer-memory 2G --use-mmap \\
+                    --buffer-size 32M --max-buffer-memory ${!BUF_MEM_MIB}M --use-mmap \\
                     --header-upload "x-amz-checksum-algorithm: CRC32C" \\
                     --header-upload "x-amz-checksum-type: FULL_OBJECT" \\
                     --header-download "Accept-Encoding: gzip" \\
                     --s3-no-check-bucket --s3-disable-checksum --s3-no-head \\
                     --metadata --s3-encoding Slash,InvalidUtf8 \\
                     --retries 3 --low-level-retries 10 --no-traverse \\
+                    --timeout 60s --contimeout 10s \\
                     --use-json-log --log-level INFO
                   Restart=always
                   RestartSec=5
@@ -608,6 +624,12 @@ Resources:
                   RestartSec=10
                   TimeoutStopSec=60
                   KillSignal=SIGTERM
+                  # watchdog 判死 = worker 冻结，而冻结源头几乎总在 rcd 进程内（h2 僵尸连接、缓冲池
+                  # 死锁两次事故均是）——只重启 worker 打不到病灶，会无限"重启-再卡死"循环。此处仅在
+                  # 死因为 watchdog 时连带重启 rcd（正常 stop/滚动重启不触发）；rcd 重启后经 Upholds
+                  # 拉回 go-worker 重注限速，链路自洽。\$\$SERVICE_RESULT：systemd 把 \$\$ 转义为字面 \$，
+                  # 由 sh 从环境变量读 SERVICE_RESULT（仅 ExecStopPost 阶段有值）。
+                  ExecStopPost=/bin/sh -c '[ "\$\$SERVICE_RESULT" = "watchdog" ] && systemctl restart rclone-rcd || true'
                   [Install]
                   WantedBy=multi-user.target
                   EOF

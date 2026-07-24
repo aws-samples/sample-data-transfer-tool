@@ -119,7 +119,9 @@ func ProcessMessage(
 		_ = eff.Requeue(0)
 		return Outcome{State: model.StateFatal, Counted: true, RecordFailed: recordFailed}
 	default: // UNKNOWN
-		_ = eff.Requeue(0)
+		// 按 error_class 查退避：worker_shutdown 60s（防 watchdog 杀后 0 秒重投形成
+		// "重启-再咬住同批消息-再卡死"紧循环），其余 UNKNOWN 仍 0 秒立即重投。
+		_ = eff.Requeue(classify.RetryDelaySeconds(result.ErrorClass))
 		return Outcome{State: model.StateUnknown, Counted: false, RecordFailed: recordFailed}
 	}
 }

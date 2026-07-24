@@ -61,6 +61,11 @@ var retryDelayByClass = map[string]int{
 	"src_5xx":        60,
 	"dst_5xx":        60,
 	"net_transient":  30,
+	// worker_shutdown 必须带退避：watchdog 杀 worker 时在途消息若 0 秒重投，重启后的
+	// worker 立刻重新咬住同一批消息——若卡死源在 rcd 侧未清除，就是"重启-再卡死"死循环
+	// （2026-07-23 缓冲池死锁事故实证）。60s 给 rcd 侧自愈（连带重启/池释放）留窗口；
+	// 代价仅是正常滚动重启的在途消息多等 1 分钟。
+	"worker_shutdown": 60,
 }
 
 // RetryDelaySeconds 按 error_class 返回重投 VisibilityTimeout 秒数。

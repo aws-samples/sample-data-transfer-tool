@@ -74,14 +74,15 @@ func TestGracefulSigtermNotOOM(t *testing.T) {
 
 func TestRetryDelaySeconds(t *testing.T) {
 	cases := map[string]int{
-		"src_rate_limit": 300,
-		"src_5xx":        60,
-		"dst_5xx":        60,
-		"net_transient":  30,
-		"src_not_found":  0,
-		"worker_oom":     0,
-		"":               0,
-		"uncategorized":  0,
+		"src_rate_limit":  300,
+		"src_5xx":         60,
+		"dst_5xx":         60,
+		"net_transient":   30,
+		"worker_shutdown": 60,
+		"src_not_found":   0,
+		"worker_oom":      0,
+		"":                0,
+		"uncategorized":   0,
 	}
 	for cls, want := range cases {
 		if got := RetryDelaySeconds(cls); got != want {
