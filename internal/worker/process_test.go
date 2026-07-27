@@ -121,6 +121,31 @@ func TestUnknownNotCounted(t *testing.T) {
 	}
 }
 
+// RETRYABLE 态绝不 0 秒重投（不变量）：词表缝隙漏出的类（uncategorized/rcd_stats_reset 等）
+// 曾以 0s 秒级回灌限流后端、在 rcd 重启窗口把未传输消息烧进 DLQ。表值优先，无表项 30s 下限。
+func TestRetryableNeverRequeuesZero(t *testing.T) {
+	cases := []struct {
+		errClass string
+		wantMin  int
+	}{
+		{"rcd_stats_reset", 60}, // 表值
+		{"uncategorized", 30},   // 下限
+		{"", 30},                // 空 class 也不许 0s
+	}
+	for _, tc := range cases {
+		r := &recorder{}
+		out := ProcessMessage(context.Background(), okBody, "i#0", "ts",
+			r.effects(model.RunResult{State: model.StateRetryable, ErrorClass: tc.errClass}))
+		if out.State != model.StateRetryable {
+			t.Fatalf("class=%q outcome=%+v", tc.errClass, out)
+		}
+		if !r.requeued || r.requeueDelay < tc.wantMin {
+			t.Errorf("class=%q 应 requeue ≥%ds，got requeued=%v delay=%d",
+				tc.errClass, tc.wantMin, r.requeued, r.requeueDelay)
+		}
+	}
+}
+
 // watchdog 杀 worker（SIGTERM→worker_shutdown）时在途消息必须带退避重投：0 秒重投会让
 // 重启后的 worker 立刻重新咬住同批消息，若卡死源在 rcd 侧未清除即成"重启-再卡死"死循环
 // （2026-07-23 缓冲池死锁事故实证）。

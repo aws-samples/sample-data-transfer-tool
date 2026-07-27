@@ -15,7 +15,7 @@
   { "ParameterKey": "WorkerThreads", "ParameterValue": "4" },
   { "ParameterKey": "RootVolumeSize", "ParameterValue": "30" },
   { "ParameterKey": "GitRepoUrl", "ParameterValue": "https://github.com/aws-samples/sample-data-transfer-tool" },
-  { "ParameterKey": "GoWorkerReleaseTag", "ParameterValue": "go-worker-v0.5.3" },
+  { "ParameterKey": "GoWorkerReleaseTag", "ParameterValue": "go-worker-v0.5.4" },
   { "ParameterKey": "RcloneS3Key", "ParameterValue": "ops/rclone-v1.74.3-arm64" },
   { "ParameterKey": "KeyPairName", "ParameterValue": "linnjia-us-east-1" },
   { "ParameterKey": "ProjectTag", "ParameterValue": "gcs-s3-migration-smoke" }

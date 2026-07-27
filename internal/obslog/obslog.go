@@ -88,6 +88,22 @@ func emit(level Level, format string, args ...any) {
 // Infof 仅控制台（journald），不进 ops 文件/CW。
 func Infof(format string, args ...any) { emit(INFO, format, args...) }
 
+// InfoOpsf INFO 级但落 ops 文件：专供**低频聚合行**（30s 进度行、停机汇总）。
+// 这些行是吞吐/RecordFail 的唯一聚合出口，只进 journald 就只能逐机 SSH 看（观测断链）；
+// 但它们不是告警，不该借 WARNING 级别混进告警流。频率 ~2 条/分钟，与 per-transfer
+// INFO 洪泛（7-23 事故 217 万条/30s）无关。高频路径禁用本函数。
+func InfoOpsf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	std.console.Printf("%s %s", INFO, msg)
+	std.mu.Lock()
+	f := std.opsFile
+	std.mu.Unlock()
+	if f != nil {
+		line := fmt.Sprintf("%s %s %s\n", time.Now().UTC().Format("2006-01-02T15:04:05.000"), INFO, msg)
+		_, _ = f.Write([]byte(line))
+	}
+}
+
 // Warnf WARNING：控制台 + ops 文件 → CW。
 func Warnf(format string, args ...any) { emit(WARNING, format, args...) }
 
@@ -133,10 +149,20 @@ func (w *rotWriter) Write(p []byte) (int, error) {
 
 // rotate 关闭当前文件，path→path.1→path.2... 滚动，重开 path。
 func (w *rotWriter) rotate() {
-	if w.f != nil {
-		_ = w.f.Close()
-		w.f = nil
+	// 守卫：w.f==nil 说明上次重开失败、本次是重试——只重试 OpenFile，不再执行 rename
+	// 阶梯。否则每条日志都重入 rotate（size 仍>maxBytes 恒真）、每次把归档向上移位，
+	// keep 轮内就把全部历史归档冲毁——恰恰毁在运维最需要历史日志的故障时刻。
+	if w.f == nil {
+		f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- same operator-controlled path.
+		if err != nil {
+			return // 仍失败：保持退化态（仅 stderr），下条日志再试。
+		}
+		w.f = f
+		w.size = 0
+		return
 	}
+	_ = w.f.Close()
+	w.f = nil
 	for i := w.keep - 1; i >= 1; i-- {
 		_ = os.Rename(fmt.Sprintf("%s.%d", w.path, i), fmt.Sprintf("%s.%d", w.path, i+1))
 	}
@@ -145,7 +171,8 @@ func (w *rotWriter) rotate() {
 	}
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- same operator-controlled path opened during rotation.
 	if err != nil {
-		// 重开失败：退回 stderr，避免丢日志崩溃。
+		// 重开失败：退回 stderr，避免丢日志崩溃。size 保持不变，下条日志经上方守卫仅重试
+		// OpenFile，不会重复移位归档。
 		w.f = nil
 		std.console.Printf("ERROR obslog: 轮转后重开 %s 失败: %v", w.path, err)
 		return

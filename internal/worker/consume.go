@@ -68,6 +68,11 @@ const (
 	maxReceiveBatch      = 10
 	sqsSideEffectTimeout = 10 * time.Second
 	maxVisibilitySeconds = 43200
+	// receiveCallTimeout ReceiveMessage 单次调用上限。long-poll WaitTimeSeconds=20，正常
+	// 最长 ~20s 返回；给到 40s 覆盖网络往返余量。缺此上限时，SQS 连接楔死（TCP 半开、
+	// 服务端不返回）会让 receiver 永久挂在 http read 上——SDK 默认无 per-request response
+	// 超时，30s dial timeout 只管建连。receiver 挂死 → progress 冻结 → watchdog 误判僵死。
+	receiveCallTimeout = 40 * time.Second
 )
 
 // Progress 返回 receiver 循环推进计数（空闲长轮询空返也推进）。这是 watchdog 的"轮询活性"
@@ -150,11 +155,16 @@ func (c *Consumer) receiveLoop(ctx context.Context, jobCh chan<- queuedMessage, 
 		// 每轮推进进展（含下面的空 long-poll / 错误重试）——watchdog 据此判活，
 		// 空闲也算"在转"，只有 ReceiveMessage 整个卡死才不推进。
 		c.progress.Add(1)
-		out, err := c.sqs.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
-			QueueUrl:              aws.String(c.cfg.QueueURL),
+		// 单次 ReceiveMessage 加 per-call 超时（派生自父 ctx，停机仍能被取消）：SQS 连接
+		// 楔死时 receiver 不会永久挂在 http read 上，最迟 receiveCallTimeout 后返回错误并
+		// 走下面的重试路径，progress 得以继续推进，避免 watchdog 误判僵死。
+		recvCtx, recvCancel := context.WithTimeout(ctx, receiveCallTimeout)
+		out, err := c.sqs.ReceiveMessage(recvCtx, &sqs.ReceiveMessageInput{
+			QueueUrl:            aws.String(c.cfg.QueueURL),
 			MaxNumberOfMessages: safeReceiveBatch(taken),
 			WaitTimeSeconds:     20, // long-poll
 		})
+		recvCancel()
 		if err != nil {
 			c.releaseSlots(slots, taken)
 			if ctx.Err() != nil {
@@ -167,9 +177,16 @@ func (c *Consumer) receiveLoop(ctx context.Context, jobCh chan<- queuedMessage, 
 		if unused := taken - len(out.Messages); unused > 0 {
 			c.releaseSlots(slots, unused)
 		}
+		// 先把整批 registerInflight 再逐条分发：停机时 ctx.Done 分支只处理手上这一条，
+		// 本批未 range 到的尾部消息若不在 inflight map 里，drain 末尾的
+		// resetInflightVisibility 扫不到它们 → 只能干等自身 visibility（最长 12h）自然
+		// 重投，违背停机"立即重投"承诺。批量前置注册后，已分发消息由 handle 的 defer
+		// finishInflight 移除，drain 时 map 里只剩真正未分发的尾部，兜底重置恰好覆盖。
+		for _, m := range out.Messages {
+			c.registerInflight(aws.ToString(m.ReceiptHandle))
+		}
 		for _, m := range out.Messages {
 			receipt := aws.ToString(m.ReceiptHandle)
-			c.registerInflight(receipt)
 			select {
 			case <-ctx.Done():
 				c.resetOneVisibility(receipt)

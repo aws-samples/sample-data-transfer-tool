@@ -17,19 +17,23 @@ import (
 
 // fakeSQS 模拟 SQS：首批返回 n 条消息，之后空（long-poll 模拟）。
 type fakeSQS struct {
-	mu           sync.Mutex
-	delivered    bool
-	n            int
-	deletes      atomic.Int64
-	visChange    atomic.Int64
-	maxReceive   atomic.Int64
-	deleteCtxErr error
-	visCtxErr    error
+	mu              sync.Mutex
+	delivered       bool
+	n               int
+	deletes         atomic.Int64
+	visChange       atomic.Int64
+	maxReceive      atomic.Int64
+	recvHadDeadline atomic.Bool
+	deleteCtxErr    error
+	visCtxErr       error
 }
 
-func (f *fakeSQS) ReceiveMessage(_ context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+func (f *fakeSQS) ReceiveMessage(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, ok := ctx.Deadline(); ok {
+		f.recvHadDeadline.Store(true)
+	}
 	f.maxReceive.Store(int64(in.MaxNumberOfMessages))
 	if f.delivered {
 		time.Sleep(10 * time.Millisecond)
@@ -90,6 +94,32 @@ func TestConsumer_ReceiveBatchCappedByWorkerSlots(t *testing.T) {
 	}
 	if fs.deletes.Load() != 2 {
 		t.Fatalf("fakeSQS 首批最多应交付 2 条，got deletes=%d", fs.deletes.Load())
+	}
+}
+
+// receiver 的 ReceiveMessage 必须带 per-call 超时（deadline），否则 SQS 连接楔死时
+// receiver 永久挂在 http read 上、progress 冻结、watchdog 误判僵死。
+func TestConsumer_ReceiveMessageHasPerCallDeadline(t *testing.T) {
+	fs := &fakeSQS{n: 1}
+	rec := &fakeRecorder{}
+	stats := &Stats{}
+	runCopy := func(_ context.Context, _ message.TransferMessage) model.RunResult {
+		return model.RunResult{State: model.StateSuccess}
+	}
+	c := NewConsumer(fs, ConsumerConfig{QueueURL: "q", Receivers: 1, Workers: 2}, "i#0",
+		runCopy, rec, stats)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.Run(ctx); close(done) }()
+	for i := 0; i < 100 && !fs.recvHadDeadline.Load(); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if !fs.recvHadDeadline.Load() {
+		t.Fatal("ReceiveMessage 必须收到带 deadline 的 ctx（per-call 超时），got 无 deadline")
 	}
 }
 
@@ -170,8 +200,8 @@ func TestTally_RecordFailStillCountsFourStates(t *testing.T) {
 		return c, st
 	}
 	cases := []struct {
-		name                            string
-		o                               Outcome
+		name                                               string
+		o                                                  Outcome
 		success, fatal, retry, unknown, poison, recordFail int64
 	}{
 		{"success+recordfail", Outcome{State: model.StateSuccess, Counted: true, RecordFailed: true}, 1, 0, 0, 0, 0, 1},

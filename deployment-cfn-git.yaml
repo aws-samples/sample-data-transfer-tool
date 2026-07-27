@@ -166,7 +166,7 @@ Parameters:
       static binary). e.g. https://github.com/aws-samples/sample-data-transfer-tool
   GoWorkerReleaseTag:
     Type: String
-    Default: go-worker-v0.5.3
+    Default: go-worker-v0.5.4
     Description: >-
       Release tag whose assets hold the go-worker binary. cfn-init downloads
       go-worker-linux-<arch> (arch from CpuArch) from
@@ -534,6 +534,10 @@ Resources:
                   # 并在内存保留到 expire（同步调用也算 job）。同步模式下 worker 拿到结果即不再查 job，
                   # 无需长保留。设长（曾误设 13h）会让高吞吐下几十万已完成 job 尸体常驻内存 → 持续涨
                   # 到 OOM（即便当前无传输/队列空，内存仍涨——客户机实测 8min 涨 14GB）。
+                  # ⚠️ --log-level NOTICE 而非 INFO：百万级迁移下 INFO 每文件多行，稳态数千行/秒，故障
+                  # 时（传输错误循环）可瞬间刷至数万行/秒打爆 journald（2026-07-23 实测 217万条/30s 被
+                  # 压制，SIGQUIT goroutine dump 被冲掉无法取证）。NOTICE 保留 error/warning/stats 摘要，
+                  # 去掉每文件 INFO（终态本就在 DDB、失败在 ops 日志），稳态日志量降两个数量级。
                   cat > /etc/systemd/system/rclone-rcd.service <<EOF
                   [Unit]
                   Description=rclone rcd daemon (shared transfer engine)
@@ -571,7 +575,7 @@ Resources:
                     --metadata --s3-encoding Slash,InvalidUtf8 \\
                     --retries 3 --low-level-retries 10 --no-traverse \\
                     --timeout 60s --contimeout 10s \\
-                    --use-json-log --log-level INFO
+                    --use-json-log --log-level NOTICE
                   Restart=always
                   RestartSec=5
                   LimitNOFILE=1048576

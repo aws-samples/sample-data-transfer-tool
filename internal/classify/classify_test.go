@@ -79,6 +79,7 @@ func TestRetryDelaySeconds(t *testing.T) {
 		"dst_5xx":         60,
 		"net_transient":   30,
 		"worker_shutdown": 60,
+		"rcd_stats_reset": 60,
 		"src_not_found":   0,
 		"worker_oom":      0,
 		"":                0,
@@ -87,6 +88,47 @@ func TestRetryDelaySeconds(t *testing.T) {
 	for cls, want := range cases {
 		if got := RetryDelaySeconds(cls); got != want {
 			t.Errorf("RetryDelaySeconds(%q) = %d, want %d", cls, got, want)
+		}
+	}
+}
+
+// RETRYABLE 态退避不变量：绝不 0 秒重投。0s 会把失败中的消息秒级灌回挣扎中的后端
+// （7-22 h2 事故重投风暴、rcd_stats_reset 烧 DLQ 同形状）。表内类用表值，未命中给 30s 下限。
+func TestRetryableDelayNeverZero(t *testing.T) {
+	cases := map[string]int{
+		"src_rate_limit":  300, // 表值优先
+		"rcd_stats_reset": 60,
+		"uncategorized":   30, // 无表项 → 30s 下限
+		"src_acl_deny":    30, // 403 quota 被归 acl 时（GCS 403 配额文案）仍有退避
+		"":                30,
+	}
+	for cls, want := range cases {
+		if got := RetryableDelaySeconds(cls); got != want {
+			t.Errorf("RetryableDelaySeconds(%q) = %d, want %d", cls, got, want)
+		}
+	}
+}
+
+// 词表对称性回归：判态正则（transientError）认得的限流/配额文案，分类正则也必须给出
+// 带退避的 class——否则 RETRYABLE + 0s 组合复活。两条实证串来自对抗验证的可触发反例。
+func TestRateLimitQuotaClassifiedWithBackoff(t *testing.T) {
+	cases := []struct {
+		stderr string
+		want   string
+	}{
+		// GCS 真实限流文案带空格，旧表只写了无空格 "ratelimit" 曾漏网
+		{"rate limit exceeded for bucket gs://x", "src_rate_limit"},
+		// GCS 日配额真实形态：403 伴随 Quota exceeded，旧表先命中 403 归 acl_deny(0s)
+		{"googleapi: Error 403: Quota exceeded for quota metric 'egress'", "src_rate_limit"},
+		{"user rate limit exceeded", "src_rate_limit"},
+	}
+	for _, c := range cases {
+		got := ClassifyError(1, c.stderr)
+		if got != c.want {
+			t.Errorf("ClassifyError(%q) = %q, want %q", c.stderr, got, c.want)
+		}
+		if d := RetryableDelaySeconds(got); d < 30 {
+			t.Errorf("%q 的退避 %ds < 30s，RETRYABLE 零退避复活", c.stderr, d)
 		}
 	}
 }

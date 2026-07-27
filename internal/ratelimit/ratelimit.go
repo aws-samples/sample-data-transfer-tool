@@ -29,7 +29,9 @@ type RCDLimiter interface {
 	SetTPSLimit(ctx context.Context, tps float64) error
 }
 
-// Limiter 启动时读一次 SSM 固定上限并设 rcd。读取失败视作 off（不限速），只告警不阻断启动。
+// Limiter 启动时读一次 SSM 固定上限并设 rcd。**fail-fast 硬红线**：读/设失败即返回
+// error 令启动中止（见 ApplyOnce），绝不静默降级为不限速——漏限=打爆源端配额/429。
+// 仅当参数名为空或 SSM 值为 off/空（运维有意不限）才放行。
 type Limiter struct {
 	ssm          SSMAPI
 	rcd          RCDLimiter

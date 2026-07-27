@@ -116,4 +116,14 @@ func TestWatchdogInterval(t *testing.T) {
 	if got := watchdogInterval(); got != 30*time.Second {
 		t.Errorf("非法 WATCHDOG_USEC 应回退 30s,got %v", got)
 	}
+	// 边界加固:usec=1 时 usec/2=0,若不判除法结果会 NewTicker(0) panic 带崩进程;
+	// 微秒级则退化忙轮询。低于 1s 的 interval 一律回退默认。
+	t.Setenv("WATCHDOG_USEC", "1")
+	if got := watchdogInterval(); got != 30*time.Second {
+		t.Errorf("WATCHDOG_USEC=1(usec/2=0) 应回退 30s 防 NewTicker(0) panic,got %v", got)
+	}
+	t.Setenv("WATCHDOG_USEC", "1000000") // 1s → interval 0.5s < 1s 下限
+	if got := watchdogInterval(); got != 30*time.Second {
+		t.Errorf("亚秒 interval 应回退 30s 防忙轮询,got %v", got)
+	}
 }

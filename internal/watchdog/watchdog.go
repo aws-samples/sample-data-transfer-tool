@@ -163,11 +163,16 @@ func probe(ctx context.Context, activityProbe func(context.Context) (int64, bool
 	return activityProbe(pctx)
 }
 
-// watchdogInterval 从 systemd WATCHDOG_USEC 取 1/2（留充足余量）；无则 30s。
+// watchdogInterval 从 systemd WATCHDOG_USEC 取 1/2（留充足余量）；无/非法/过小则 30s。
 func watchdogInterval() time.Duration {
 	if v := os.Getenv("WATCHDOG_USEC"); v != "" {
 		if usec, err := strconv.ParseInt(v, 10, 64); err == nil && usec > 0 {
-			return time.Duration(usec/2) * time.Microsecond
+			// 对除法结果而非原值判界：usec=1 时 usec/2=0 → NewTicker(0) panic 带崩进程；
+			// 微秒级则退化忙轮询狂打 rcd probe。低于 1s 的值不是合理的 watchdog 配置，
+			// 一律回退默认（生产 systemd 注入 1.2e8 不受影响，这是边界加固）。
+			if d := time.Duration(usec/2) * time.Microsecond; d >= time.Second {
+				return d
+			}
 		}
 	}
 	return 30 * time.Second

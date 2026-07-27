@@ -96,7 +96,9 @@ func Run(ctx context.Context, cfg Config) error {
 	// 先停 writer（排空终态队列 + 末批 flush），使 drain 阶段批写失败的 RecordFail 增量
 	// 计入下方停机汇总；否则 defer 的 StopWriter 会在汇总日志之后才执行，漏报这部分。
 	store.StopWriter()
-	obslog.Infof("worker 已停止 | total=%d success=%d retryable=%d fatal=%d unknown=%d poison=%d record_fail=%d delete_fail=%d requeue_fail=%d",
+	// InfoOpsf：停机汇总落 ops 文件（低频聚合行），不只进 journald——逐机 SSH 才能看的
+	// 聚合数据等于没有（观测断链）。
+	obslog.InfoOpsf("worker 已停止 | total=%d success=%d retryable=%d fatal=%d unknown=%d poison=%d record_fail=%d delete_fail=%d requeue_fail=%d",
 		stats.Total.Load(), stats.Success.Load(), stats.Retryable.Load(), stats.Fatal.Load(),
 		stats.Unknown.Load(), stats.Poison.Load(), stats.RecordFail.Load(), stats.DeleteFail.Load(), stats.RequeueFail.Load())
 	return nil
@@ -105,7 +107,13 @@ func Run(ctx context.Context, cfg Config) error {
 func waitRCDReady(ctx context.Context, c *rcd.Client, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if err := c.Noop(ctx); err == nil {
+		// 单次探测必须有硬上限：rcd client 刻意无全局 Timeout（传输可跑数分钟），rcd
+		// 半死（接受 TCP 不回包）时无超时的 Noop 会永久挂起，"最多等 timeout"承诺失效、
+		// fail-fast 启动语义被破坏（只能靠 systemd TimeoutStartSec 兜底且丢诊断日志）。
+		pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err := c.Noop(pctx)
+		cancel()
+		if err == nil {
 			return nil
 		}
 		select {
@@ -124,7 +132,12 @@ func heartbeatLoop(ctx context.Context, store *status.Store, instanceID string, 
 		hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		now := time.Now()
-		_ = store.WriteHeartbeat(hbCtx, instanceID, status.NowISO(), now.Unix(), workers)
+		// 心跳表是外部判活的唯一信号：写失败必须可见（Warnf→ops），否则监控侧无法区分
+		// "实例活着但 DDB 写不进"与"实例真死"，可能触发误 remediation。不重试——下一
+		// tick 30s 后自然重写（同 watchdog notifier 对低频判活信号失败的处理先例）。
+		if err := store.WriteHeartbeat(hbCtx, instanceID, status.NowISO(), now.Unix(), workers); err != nil {
+			obslog.Warnf("心跳写入失败（实例仍存活，DDB 侧问题）: %v", err)
+		}
 	}
 	write()
 	for {
@@ -145,7 +158,9 @@ func progressLoop(ctx context.Context, stats *worker.Stats) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			obslog.Infof("进度: total=%d success=%d retryable=%d fatal=%d unknown=%d poison=%d record_fail=%d delete_fail=%d requeue_fail=%d",
+			// InfoOpsf：进度行落 ops 文件（30s 一条，低频），吞吐/RecordFail 聚合数据
+			// 不再只困在 journald（此前注释声称"打到 worker-ops"实为 Infof，言行不一）。
+			obslog.InfoOpsf("进度: total=%d success=%d retryable=%d fatal=%d unknown=%d poison=%d record_fail=%d delete_fail=%d requeue_fail=%d",
 				stats.Total.Load(), stats.Success.Load(), stats.Retryable.Load(), stats.Fatal.Load(),
 				stats.Unknown.Load(), stats.Poison.Load(), stats.RecordFail.Load(), stats.DeleteFail.Load(), stats.RequeueFail.Load())
 		}

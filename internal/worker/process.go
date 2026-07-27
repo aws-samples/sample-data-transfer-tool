@@ -113,7 +113,9 @@ func ProcessMessage(
 		}
 		return Outcome{State: model.StateSuccess, Counted: true, RecordFailed: recordFailed}
 	case model.StateRetryable:
-		_ = eff.Requeue(classify.RetryDelaySeconds(result.ErrorClass))
+		// RETRYABLE 专用取退避：表值优先、无表项 30s 下限——RETRYABLE 绝不 0 秒重投
+		// （词表缝隙漏出的类曾以 0s 秒级回灌限流后端/烧 DLQ，见 classify 注释）。
+		_ = eff.Requeue(classify.RetryableDelaySeconds(result.ErrorClass))
 		return Outcome{State: model.StateRetryable, Counted: true, RecordFailed: recordFailed}
 	case model.StateFatal:
 		_ = eff.Requeue(0)

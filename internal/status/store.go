@@ -2,6 +2,7 @@ package status
 
 import (
 	"context"
+	"math/rand/v2" // #nosec G404 -- 重试抖动非安全用途
 	"strconv"
 	"strings"
 	"sync"
@@ -276,9 +277,14 @@ func dedupeToWriteRequests(items []terminalItem) []ddbtypes.WriteRequest {
 	return reqs
 }
 
-// sleepBackoff 退避 *d 并翻倍（上限 1s）；ctx 取消则返回 false（停止重试）。
+// sleepBackoff 退避并翻倍（上限 1s）；ctx 取消则返回 false（停止重试）。
+// 实际睡眠 = *d/2 + rand[0, *d/2]（equal jitter）：UnprocessedItems 是 200 响应体字段，
+// SDK retryer 不管它，只有这段手写循环重试——纯确定性倍增会让全 fleet 各机在完全相同的
+// 时刻齐射重发同一热分区，放大节流（AWS 对 BatchWriteItem 重试明确要求 backoff with jitter）。
 func sleepBackoff(ctx context.Context, d *time.Duration) bool {
-	t := time.NewTimer(*d)
+	half := *d / 2
+	sleep := half + rand.N(half+1)
+	t := time.NewTimer(sleep)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():

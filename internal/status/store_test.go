@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -24,8 +25,8 @@ type fakeDDB struct {
 	lastTable string
 
 	// BatchWriteItem（终态）
-	batchTable  string
-	batchItems  []map[string]ddbtypes.AttributeValue // 所有已“成功写入”的 item（累计）
+	batchTable           string
+	batchItems           []map[string]ddbtypes.AttributeValue // 所有已“成功写入”的 item（累计）
 	batchCalls           int
 	unprocessed          int   // 前 N 次调用返回 1 条 UnprocessedItems，模拟节流（一次性）
 	unprocessedEveryCall bool  // 每次都截留 1 条未处理（模拟持续未写入，永不收敛）
@@ -277,5 +278,33 @@ func TestDedupeToWriteRequests(t *testing.T) {
 	// 第一条键 (p1,s1) 应保留后写的 "b"
 	if got := sval(reqs[0].PutRequest.Item["v"]); got != "b" {
 		t.Errorf("同键应后写覆盖，got %q want b", got)
+	}
+}
+
+// sleepBackoff 抖动边界：实际睡眠 ∈ [d/2, d]（equal jitter），且 d 仍按倍增推进。
+// 纯确定性倍增会让全 fleet 在相同时刻齐射重发同一热分区（AWS 对 BatchWriteItem
+// 重试明确要求 jitter）。
+func TestSleepBackoff_JitterBoundsAndDoubling(t *testing.T) {
+	d := 50 * time.Millisecond
+	start := time.Now()
+	if !sleepBackoff(context.Background(), &d) {
+		t.Fatal("非取消 ctx 应返回 true")
+	}
+	elapsed := time.Since(start)
+	// 下界 25ms（含调度余量放宽到 20ms），上界 50ms（放宽到 200ms 防慢 CI 误报）
+	if elapsed < 20*time.Millisecond {
+		t.Errorf("睡眠 %v 低于 jitter 下界 d/2=25ms", elapsed)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("睡眠 %v 远超上界 d=50ms", elapsed)
+	}
+	if d != 100*time.Millisecond {
+		t.Errorf("退避基值应倍增 50ms→100ms，got %v", d)
+	}
+	// ctx 已取消：应立即 false，不睡
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if sleepBackoff(ctx, &d) {
+		t.Error("已取消 ctx 应返回 false")
 	}
 }

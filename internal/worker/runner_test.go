@@ -174,7 +174,7 @@ func TestRunCopy_H2StuckConnectionNetTransient(t *testing.T) {
 	f := newFakeRCDServer(t)
 	f.errBody = `operation error S3: HeadObject, https response error StatusCode: 0, request send failed, ` +
 		`Head "https://x.storage.googleapis.com/a.gz": http2: timeout awaiting response headers`
-	res := f.runner(5 * time.Second).RunCopy(context.Background(), copyMsg)
+	res := f.runner(5*time.Second).RunCopy(context.Background(), copyMsg)
 	if res.State != model.StateRetryable || res.ErrorClass != "net_transient" {
 		t.Errorf("h2 僵死连接应 RETRYABLE/net_transient，got %s/%s", res.State, res.ErrorClass)
 	}
@@ -186,7 +186,7 @@ func TestRunCopy_DeleteNetworkErrorNotFalseSuccess(t *testing.T) {
 	f := newFakeRCDServer(t)
 	f.errBody = `Delete "https://x.storage.googleapis.com/a": dial tcp: lookup x: no such host`
 	delMsg := message.TransferMessage{Destination: "s3:b/k", Op: model.OpDelete}
-	res := f.runner(5 * time.Second).RunCopy(context.Background(), delMsg)
+	res := f.runner(5*time.Second).RunCopy(context.Background(), delMsg)
 	if res.State == model.StateSuccess {
 		t.Fatalf("delete 遇 'no such host' 网络错误被误判假成功(会丢消息)，got %s/%s", res.State, res.ErrorClass)
 	}

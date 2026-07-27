@@ -16,8 +16,12 @@ var errorPatterns = []struct {
 	re    *regexp.Regexp
 	label string // 空串表示用 5xx resolver 再分流
 }{
-	// 限流 429 优先（真实传输错误，根因价值最高）
-	{regexp.MustCompile(`(?i)\b429\b|too many requests|ratelimit`), "src_rate_limit"},
+	// 限流 429/配额 优先（真实传输错误，根因价值最高）。
+	// rate\s*limit 带空格变体 + quota exceeded：GCS 日配额真实文案是 "403 ... Quota exceeded"，
+	// 必须排在 403/acl 之前——配额是限流问题（要 300s 退避等窗口恢复），不是权限问题（0s 烧 DLQ）。
+	// 词表须与下方 transientError 保持对称：判态认得的限流文案，这里也要给出带退避的 class，
+	// 否则落 uncategorized/acl_deny → RETRYABLE + 0s 秒级回灌限流后端（对抗审查实证反例）。
+	{regexp.MustCompile(`(?i)\b429\b|too many requests|rate\s*limit|quota.{0,40}exceeded|exceeded.{0,40}quota|egress bandwidth`), "src_rate_limit"},
 	// 完整性校验
 	{regexp.MustCompile(`(?i)hash (mismatch|differ)|corrupted on transfer`), "integrity_hash"},
 	// 403 / 权限
@@ -66,14 +70,35 @@ var retryDelayByClass = map[string]int{
 	// （2026-07-23 缓冲池死锁事故实证）。60s 给 rcd 侧自愈（连带重启/池释放）留窗口；
 	// 代价仅是正常滚动重启的在途消息多等 1 分钟。
 	"worker_shutdown": 60,
+	// rcd_stats_reset：stats-reset 前置失败（copy 从未执行）多因 rcd 短暂不可达/僵死。
+	// 0s 重投会 5s/次烧 receive count，watchdog 判死重启 rcd 前（最坏 ~180s）就把从未
+	// 传输的好消息烧进 DLQ（maxReceiveCount=3 × ~15s）。60s 对齐 worker_shutdown，
+	// 熬过 rcd 自愈窗口（30s 不够：30×3=90s 仍可能落在判死窗口内）。
+	"rcd_stats_reset": 60,
 }
 
-// RetryDelaySeconds 按 error_class 返回重投 VisibilityTimeout 秒数。
+// retryableFloorSeconds RETRYABLE 态的退避下限。RETRYABLE 语义=“带退避重试”，
+// 0s 重投是它的语义反面：把失败中的消息秒级灌回挣扎中的后端（限流风暴放大/烧 DLQ）。
+// 判态词表（transientError 宽正则）与分类词表（errorPatterns）难以永久对称，
+// 词表缝隙里漏出的 RETRYABLE 类由此下限兜底，杜绝 RETRYABLE+0s 组合复活。
+const retryableFloorSeconds = 30
+
+// RetryDelaySeconds 按 error_class 返回重投 VisibilityTimeout 秒数（无表项 → 0，
+// 供 FATAL/UNKNOWN 等“快速烧 DLQ / 立即重投”路径使用）。
 func RetryDelaySeconds(errorClass string) int {
 	if d, ok := retryDelayByClass[errorClass]; ok {
 		return d
 	}
 	return 0
+}
+
+// RetryableDelaySeconds RETRYABLE 态专用：表值优先，无表项给 retryableFloorSeconds
+// 下限——RETRYABLE 绝不 0 秒重投（不变量）。
+func RetryableDelaySeconds(errorClass string) int {
+	if d, ok := retryDelayByClass[errorClass]; ok {
+		return d
+	}
+	return retryableFloorSeconds
 }
 
 // ClassifyError 把错误文本映射为低基数 error_class（空串=无错误/未命中）。
