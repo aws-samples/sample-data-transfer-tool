@@ -166,7 +166,7 @@ Parameters:
       static binary). e.g. https://github.com/aws-samples/sample-data-transfer-tool
   GoWorkerReleaseTag:
     Type: String
-    Default: go-worker-v0.5.4
+    Default: go-worker-v0.5.3
     Description: >-
       Release tag whose assets hold the go-worker binary. cfn-init downloads
       go-worker-linux-<arch> (arch from CpuArch) from
