@@ -31,18 +31,6 @@ Parameters:
     Type: String
     Default: ''
     Description: EC2 Key Pair name (optional)
-  OneDriveClientId:
-    Type: String
-    NoEcho: true
-    Description: OneDrive Application Client ID
-  OneDriveClientSecret:
-    Type: String
-    NoEcho: true
-    Description: OneDrive Application Client Secret
-  OneDriveTenantId:
-    Type: String
-    NoEcho: true
-    Description: OneDrive Tenant ID
   DropboxAppKey:
     Type: String
     Default: ''
@@ -88,17 +76,14 @@ Parameters:
     Description: Number of worker threads per agent instance
 
 Resources:
-  # Secrets Manager for OneDrive Credentials
-  OneDriveSecret:
+  # Secrets Manager for Dropbox Credentials
+  DropboxSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub '${AWS::StackName}-onedrive-credentials'
-      Description: OneDrive application credentials
+      Name: !Sub '${AWS::StackName}-dropbox-credentials'
+      Description: Dropbox application credentials
       SecretString: !Sub |
         {
-          "client_id": "${OneDriveClientId}",
-          "client_secret": "${OneDriveClientSecret}",
-          "tenant_id": "${OneDriveTenantId}",
           "dropbox_app_key": "${DropboxAppKey}",
           "dropbox_app_secret": "${DropboxAppSecret}",
           "dropbox_refresh_token": "${DropboxRefreshToken}"
@@ -239,7 +224,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Ref OneDriveSecret
+                Resource: !Ref DropboxSecret
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -304,7 +289,7 @@ Resources:
                 #!/usr/bin/env python3
                 """
                 Token Refresh Script for rclone
-                Maintains remotes: s3, onedrive, sharepoint, dropbox (optional)
+                Maintains remotes: s3, dropbox
                 """
                 import requests
                 import json
@@ -314,41 +299,9 @@ Resources:
                 import logging
                 from pathlib import Path
                 from datetime import datetime, timedelta, timezone
-                
+
                 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
                 logger = logging.getLogger(__name__)
-                
-                def get_credentials():
-                    """Retrieve OneDrive credentials from AWS Secrets Manager"""
-                    secrets_client = boto3.client('secretsmanager', region_name=os.environ['AWS_REGION'])
-                    secret_response = secrets_client.get_secret_value(SecretId=os.environ['SECRET_ARN'])
-                    credentials = json.loads(secret_response['SecretString'])
-                    return credentials['client_id'], credentials['client_secret'], credentials['tenant_id']
-                
-                def get_token():
-                    """Get OAuth2 token from Microsoft"""
-                    CLIENT_ID, CLIENT_SECRET, TENANT_ID = get_credentials()
-                    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-                    data = {
-                        'client_id': CLIENT_ID,
-                        'client_secret': CLIENT_SECRET,
-                        'scope': 'https://graph.microsoft.com/.default',
-                        'grant_type': 'client_credentials'
-                    }
-                    
-                    response = requests.post(token_url, data=data)
-                    response.raise_for_status()
-                    token_data = response.json()
-                    
-                    expires_in = token_data.get('expires_in', 3600)
-                    expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-                    
-                    return {
-                        'access_token': token_data['access_token'],
-                        'token_type': 'Bearer',
-                        'expiry': expiry.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
-                        'expires_in': expires_in
-                    }
 
                 def get_dropbox_credentials():
                     """Retrieve Dropbox credentials from AWS Secrets Manager (optional)"""
@@ -387,12 +340,9 @@ Resources:
                     }
 
                 def update_rclone_config():
-                    """Update rclone configuration with simplified 3-remote setup"""
+                    """Update rclone configuration with s3 and dropbox remotes"""
                     logger.info("Starting rclone configuration update")
-                    
-                    rclone_token = get_token()
-                    CLIENT_ID, CLIENT_SECRET, TENANT_ID = get_credentials()
-                    
+
                     for user_home in ['/root', '/home/ec2-user']:
                         logger.info(f"Updating rclone config for {user_home}")
                         rclone_config_path = Path(user_home) / ".config/rclone/rclone.conf"
@@ -411,36 +361,6 @@ Resources:
                             'region': os.environ.get('S3_REGION') or os.environ.get('AWS_REGION', 'eu-central-1')
                         })
                         
-                        # Configure OneDrive remote (business drive) - update token
-                        if 'onedrive' not in config:
-                            config.add_section('onedrive')
-                        config['onedrive'].update({
-                            'type': 'onedrive',
-                            'client_id': CLIENT_ID,
-                            'client_secret': CLIENT_SECRET,
-                            'tenant': TENANT_ID,
-                            'auth_url': f'https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/authorize',
-                            'token_url': f'https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token',
-                            'drive_type': 'business',
-                            'token': json.dumps(rclone_token)
-                        })
-                        
-                        # Configure SharePoint remote (document library) - update token
-                        if 'sharepoint' not in config:
-                            config.add_section('sharepoint')
-                        config['sharepoint'].update({
-                            'type': 'onedrive',
-                            'client_id': CLIENT_ID,
-                            'client_secret': CLIENT_SECRET,
-                            'tenant': TENANT_ID,
-                            'auth_url': f'https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/authorize',
-                            'token_url': f'https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token',
-                            'drive_type': 'documentlibrary',
-                            'token': json.dumps(rclone_token)
-                        })
-                        
-                        logger.info("Updated tokens for onedrive and sharepoint remotes")
-
                         # Configure Dropbox remote (optional) - only if credentials present
                         DBX_APP_KEY, DBX_APP_SECRET, DBX_REFRESH_TOKEN = get_dropbox_credentials()
                         if DBX_APP_KEY and DBX_APP_SECRET and DBX_REFRESH_TOKEN:
@@ -591,8 +511,7 @@ Resources:
                         '--stats', '1m',
                         '--retries', '3',
                         '--low-level-retries', '10',
-                        '--log-level', 'INFO',
-                        '--onedrive-encoding', 'Slash,LtGt,DoubleQuote,Asterisk,Pipe,BackSlash,LeftSpace,LeftCrLfHtVt,RightSpace,RightCrLfHtVt,InvalidUtf8,Dot'
+                        '--log-level', 'INFO'
                     ]
                     
                     # Add additional rclone arguments if provided
@@ -856,7 +775,7 @@ Resources:
                 Type=oneshot
                 User=root
                 WorkingDirectory=/home/ec2-user/agent
-                Environment="SECRET_ARN=${OneDriveSecret}"
+                Environment="SECRET_ARN=${DropboxSecret}"
                 Environment="S3_REGION=${AWS::Region}"
                 Environment="AWS_REGION=${AWS::Region}"
                 ExecStart=/usr/bin/python3 /home/ec2-user/agent/refresh_rclone_config.py
@@ -921,7 +840,7 @@ Resources:
                 fi
                 echo "Token refresh completed successfully"
               env:
-                SECRET_ARN: !Ref OneDriveSecret
+                SECRET_ARN: !Ref DropboxSecret
                 S3_REGION: !Ref 'AWS::Region'
                 AWS_REGION: !Ref AWS::Region
             03_reload_systemd:
