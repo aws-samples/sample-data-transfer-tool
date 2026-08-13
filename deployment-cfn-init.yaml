@@ -876,7 +876,10 @@ Resources:
               VolumeType: gp3
         UserData:
           Fn::Base64: !Sub |
-            #!/bin/bash -xe
+            #!/bin/bash -x
+            # Do not use -e here: if cfn-init fails the script would exit
+            # immediately, cfn-signal would never run, and the stack could only
+            # fail by CreationPolicy timeout with no indication of the cause.
             # Install cfn-bootstrap
             yum install -y aws-cfn-bootstrap
             
@@ -886,9 +889,10 @@ Resources:
               --resource AgentLaunchTemplate \
               --region ${AWS::Region} \
               --configsets default
+            CFN_INIT_EXIT_CODE=$?
             
             # Signal success or failure
-            /opt/aws/bin/cfn-signal -e $? \
+            /opt/aws/bin/cfn-signal -e $CFN_INIT_EXIT_CODE \
               --stack ${AWS::StackName} \
               --resource AgentASG \
               --region ${AWS::Region}
