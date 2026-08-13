@@ -180,7 +180,7 @@ Resources:
   AgentRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${AWS::StackName}-rclone-transfer-agent-role-${AWS::Region}'
+      RoleName: !Sub '${AWS::StackName}-agent-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -239,7 +239,7 @@ Resources:
   AgentInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
-      InstanceProfileName: !Sub '${AWS::StackName}-rclone-transfer-agent-profile-${AWS::Region}'
+      InstanceProfileName: !Sub '${AWS::StackName}-agent-profile-${AWS::Region}'
       Roles:
         - !Ref AgentRole
 
