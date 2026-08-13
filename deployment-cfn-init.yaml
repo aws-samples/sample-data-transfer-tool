@@ -830,7 +830,6 @@ Resources:
               command: !Sub "aws s3 sync s3://${DestinationBucket}/user-list/ /home/ec2-user/agent/ --region ${AWS::Region} || echo 'No user-list found, will use API fallback'"
             02_refresh_token:
               command: !Sub |
-                set -e
                 timeout 300 python3 /home/ec2-user/agent/refresh_rclone_config.py
                 EXIT_CODE=$?
                 if [ $EXIT_CODE -eq 124 ]; then
