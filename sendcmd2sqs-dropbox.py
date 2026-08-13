@@ -50,6 +50,9 @@ DROPBOX_LIST_FOLDER_URL = "https://api.dropboxapi.com/2/files/list_folder"
 DROPBOX_LIST_FOLDER_CONTINUE_URL = (
     "https://api.dropboxapi.com/2/files/list_folder/continue"
 )
+DROPBOX_GET_CURRENT_ACCOUNT_URL = (
+    "https://api.dropboxapi.com/2/users/get_current_account"
+)
 
 # 一期只迁个人空间：排除挂载的团队文件夹/共享文件夹，避免跨成员重复迁移
 # Team Folder 迁移留作二期（需 Dropbox-API-Path-Root / Dropbox-API-Select-Admin）
@@ -399,6 +402,45 @@ class TokenManager:
         logger.info("Access token 已刷新")
 
 
+def get_member_home_namespace_id(token_manager, select_user):
+    """获取成员个人空间的 namespace id
+
+    本脚本枚举文件时不带 Dropbox-API-Path-Root，拿到的 path_display 是成员个人
+    空间视角（如 /migration-test/a.txt）；而 rclone dropbox 后端默认使用
+    root_namespace_id（团队空间），同一路径在团队空间视角下不存在，会报
+    directory not found。需将此 id 通过 --dropbox-root-namespace 传给 rclone，
+    使两侧视角一致。
+
+    Args:
+        token_manager: TokenManager 实例
+        select_user: 团队成员 ID (dbmid:...)
+
+    Returns:
+        str: home_namespace_id；获取失败返回 None
+    """
+    try:
+        headers = token_manager.get_headers(select_user=select_user)
+        # 该端点不接受参数，但必须发送 {} 作为 body（发 null 会返回 500）
+        response = dropbox_post(DROPBOX_GET_CURRENT_ACCOUNT_URL, headers, {})
+    except (RetryableHTTPError, RequestException) as e:
+        logger.error(f"获取成员 namespace 失败: {e}, select_user={select_user}")
+        return None
+
+    if response.status_code != 200:
+        logger.error(
+            f"获取成员 namespace 返回非200: {response.status_code}, "
+            f"select_user={select_user}, {response.text[:200]}"
+        )
+        return None
+
+    home_namespace_id = response.json().get("root_info", {}).get("home_namespace_id")
+    if not home_namespace_id:
+        logger.error(f"响应中缺少 root_info.home_namespace_id, select_user={select_user}")
+        return None
+
+    return home_namespace_id
+
+
 def list_team_members(token_manager):
     """遍历团队所有成员
 
@@ -456,12 +498,14 @@ def list_team_members(token_manager):
 
 
 # ============ 核心业务函数 ============
-def send_to_sqs(member_email, entry):
+def send_to_sqs(member_email, entry, home_namespace_id):
     """拼装消息并发送到SQS队列
 
     Args:
         member_email: 成员邮箱（用于 rclone impersonate 及目标路径）
         entry: Dropbox 文件 entry dict
+        home_namespace_id: 成员个人空间 namespace id（见
+            get_member_home_namespace_id，用于对齐枚举与 rclone 的路径视角）
 
     Returns:
         bool: 发送成功返回 True，失败返回 False
@@ -484,7 +528,15 @@ def send_to_sqs(member_email, entry):
 
     # 用 --dropbox-impersonate 在固定的 dropbox: remote 上切换成员身份
     # （对应 OneDrive 的 --onedrive-drive-id）
-    rclone_args = ["--dropbox-impersonate", f"{member_email}", "--progress"]
+    # --dropbox-root-namespace 让 rclone 使用成员个人空间做根，与上面 clean_path
+    # 的视角一致；缺少它 rclone 会用团队空间做根并报 directory not found
+    rclone_args = [
+        "--dropbox-impersonate",
+        f"{member_email}",
+        "--dropbox-root-namespace",
+        f"{home_namespace_id}",
+        "--progress",
+    ]
 
     # Add hash metadata header if available
     content_hash = entry.get("content_hash")
@@ -525,6 +577,16 @@ def process_member_files(member, token_manager, ignore_spec, cutoff_date=None):
     """
     select_user = member["team_member_id"]
     member_email = member["email"]
+
+    # rclone 需要成员个人空间的 namespace id 才能解析下面枚举出的路径
+    home_namespace_id = get_member_home_namespace_id(token_manager, select_user)
+    if not home_namespace_id:
+        logger.error(
+            f"无法获取 {member_email} 的 home_namespace_id，跳过该成员"
+            f"（继续投递会导致 rclone 报 directory not found）"
+        )
+        return 0, 0
+    logger.info(f"成员 {member_email} home_namespace_id={home_namespace_id}")
 
     file_count = 0
     skipped_count = 0
@@ -591,7 +653,7 @@ def process_member_files(member, token_manager, ignore_spec, cutoff_date=None):
                 )
 
                 # 只有发送成功才计数
-                if send_to_sqs(member_email, entry):
+                if send_to_sqs(member_email, entry, home_namespace_id):
                     file_count += 1
 
             if not response_data.get("has_more"):
