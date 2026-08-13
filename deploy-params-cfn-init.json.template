@@ -16,18 +16,6 @@
     "ParameterValue": "1"
   },
   {
-    "ParameterKey": "OneDriveClientId",
-    "ParameterValue": "YOUR_CLIENT_ID_HERE"
-  },
-  {
-    "ParameterKey": "OneDriveClientSecret",
-    "ParameterValue": "YOUR_CLIENT_SECRET_HERE"
-  },
-  {
-    "ParameterKey": "OneDriveTenantId",
-    "ParameterValue": "YOUR_TENANT_ID_HERE"
-  },
-  {
     "ParameterKey": "DropboxAppKey",
     "ParameterValue": "YOUR_DROPBOX_APP_KEY"
   },
