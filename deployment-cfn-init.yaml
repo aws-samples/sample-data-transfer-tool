@@ -48,8 +48,10 @@ Parameters:
     Description: Dropbox offline refresh token (token_access_type=offline)
   DestinationBucket:
     Type: String
-    Default: ''
-    Description: S3 bucket for destination files, agent code and logs
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]*[a-z0-9]$'
+    Description: S3 bucket for destination files and migration logs
   ProjectName:
     Type: String
     Default: 'sqs-rclone-agent'
