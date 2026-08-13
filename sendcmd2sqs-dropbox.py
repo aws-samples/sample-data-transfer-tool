@@ -2,7 +2,7 @@
 """迁移 Dropbox Advanced/Business 团队下所有成员的文件
 
 通过 Dropbox Business API 遍历团队所有成员，再以 Dropbox-API-Select-User
-方式列出每个成员个人空间的文件，组装 rclone 指令发送到 SQS（与 OneDrive 逻辑一致）。
+方式列出每个成员个人空间的文件，组装 rclone 指令发送到 SQS。
 """
 import argparse
 import json
@@ -527,7 +527,6 @@ def send_to_sqs(member_email, entry, home_namespace_id):
     logger.debug(f"Destination: {destination}")
 
     # 用 --dropbox-impersonate 在固定的 dropbox: remote 上切换成员身份
-    # （对应 OneDrive 的 --onedrive-drive-id）
     # --dropbox-root-namespace 让 rclone 使用成员个人空间做根，与上面 clean_path
     # 的视角一致；缺少它 rclone 会用团队空间做根并报 directory not found
     rclone_args = [
